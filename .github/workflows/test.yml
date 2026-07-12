@@ -1,0 +1,46 @@
+name: test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 回归测试
+        run: ./test/run.sh
+
+      # 下面这些在本地 pre-push hook 里也查了。这里再查一遍，
+      # 是因为 pre-push 可以被 --no-verify 绕过 —— CI 绕不过。
+      # GitHub Free 的私有仓用不了 Rulesets，所以 CI 拦不住合并，
+      # 但至少能把问题**显示**出来，不至于悄无声息。
+      - name: 版本号三处一致
+        run: |
+          V=$(tr -d ' \n' < VERSION)
+          CC=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")
+          CX=$(python3 -c "import json;print(json.load(open('.codex-plugin/plugin.json'))['version'])")
+          echo "VERSION=$V  claude=$CC  codex=$CX"
+          test "$V" = "$CC" && test "$V" = "$CX"
+
+      - name: hooks.json 跨平台兼容（Codex 只认 description/hooks 两个顶层键）
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          keys = set(json.load(open("hooks/hooks.json")).keys())
+          extra = keys - {"description", "hooks"}
+          if extra:
+              sys.exit(f"hooks.json 顶层含 Codex 不接受的字段 {extra} —— "
+                       f"Codex 会拒绝整个文件并静默丢弃全部 hook")
+          print("ok")
+          PY
+
+      - name: 宪法 4 KB 硬上限
+        run: |
+          N=$(wc -c < templates/constitution.md)
+          echo "constitution.md = $N B"
+          test "$N" -le 4096

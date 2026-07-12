@@ -121,6 +121,20 @@ schema/state.schema.json
 - Codex 注入 `CLAUDE_PLUGIN_ROOT` 兼容别名，所以 hook 脚本零修改复用
 - Codex 无 subagent 概念 —— 需要并行子代理的能力在 Codex 侧退化为串行
 
+## 开发
+
+克隆后跑一次，装上 pre-push 门禁：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+它会在推送前跑测试、校验版本号一致性与宪法体积，不过就拒绝推送。
+**这是唯一的真门禁** —— GitHub Rulesets 要 Team 计划，Free 版的私有仓用不了，
+所以服务端不会替你拦住任何东西。详见 [RELEASING.md](./RELEASING.md)。
+
+分支：`main` 正式版（用户装这个，永远绿）· `dev` 日常开发。
+
 ## 测试
 
 ```bash

@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# pre-push — 发布前的真门禁。
+#
+# 为什么门禁在这里，而不在 GitHub：
+#   GitHub Rulesets（要求 PR + 必过 CI）需要 Team/Enterprise 计划，Free 用不了。
+#   也就是说服务端**不会**替我们拦住任何东西。CI 能报红，但拦不住合并。
+#   所以唯一会真的拒绝你的，就是这个脚本。
+#
+# 这也正是 ratchet 自己的哲学：把「发布前要跑测试」从一句叮嘱，
+# 变成一段会拒绝你的确定性代码。
+#
+# 装：  git config core.hooksPath .githooks
+# 绕：  git push --no-verify   （能绕，但那是显式的、有意识的选择 —— 这就够了）
+
+set -u
+REMOTE="$1"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO" || exit 1
+
+FAIL=0
+say()  { printf "\033[1m[pre-push]\033[0m %s\n" "$1"; }
+bad()  { printf "\033[31m[pre-push] ✗ %s\033[0m\n" "$1"; FAIL=1; }
+good() { printf "\033[32m[pre-push] ✓ %s\033[0m\n" "$1"; }
+
+# 本次 push 涉及哪些分支
+PUSHING_MAIN=0
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  [ -z "${remote_ref:-}" ] && continue
+  case "$remote_ref" in
+    refs/heads/main) PUSHING_MAIN=1 ;;
+  esac
+done
+
+# ── 1. 测试必须绿。任何分支，无例外 ──────────────────────────
+say "跑回归测试…"
+if ./test/run.sh > /tmp/ratchet-prepush.log 2>&1; then
+  good "$(grep -oE 'PASS [0-9]+' /tmp/ratchet-prepush.log | tail -1) — 全绿"
+else
+  bad "测试未通过。坏代码不该流向任何人。"
+  echo
+  tail -20 /tmp/ratchet-prepush.log | sed 's/^/    /'
+  echo
+fi
+
+# ── 2. 推 main 时的发布检查 ─────────────────────────────────
+if [ "$PUSHING_MAIN" = "1" ]; then
+  say "目标是 main（正式版）—— 追加发布检查"
+
+  V_FILE=$(cat VERSION 2>/dev/null | tr -d ' \n')
+  V_CC=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])" 2>/dev/null)
+  V_CX=$(python3 -c "import json;print(json.load(open('.codex-plugin/plugin.json'))['version'])" 2>/dev/null)
+
+  # 2a. 三处版本号必须一致 —— 不一致会导致两个平台装到不同版本
+  if [ "$V_FILE" = "$V_CC" ] && [ "$V_FILE" = "$V_CX" ]; then
+    good "版本号三处一致：$V_FILE"
+  else
+    bad "版本号不一致 — VERSION=$V_FILE  claude=$V_CC  codex=$V_CX"
+  fi
+
+  # 2b. 版本号必须比最新 tag 新
+  #     这条最容易忘，而且后果隐蔽：Codex 的 plugin cache 路径是
+  #     .../<plugin>/<version>/ 且是**物理拷贝**。版本号没变，用户
+  #     even 跑了 update 也还在用旧 cache —— 而且完全没有报错。
+  LAST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -1 | sed 's/^v//')
+  if [ -n "$LAST_TAG" ] && [ "$V_FILE" = "$LAST_TAG" ]; then
+    bad "VERSION ($V_FILE) 与最新 tag (v$LAST_TAG) 相同 —— 忘记 bump 了。
+       后果：Codex 的 plugin cache 按 version 分目录且是物理拷贝，
+       版本号不变 → 用户永远拉不到新代码，且毫无报错。"
+  elif [ -n "$LAST_TAG" ]; then
+    good "版本已 bump：v$LAST_TAG → v$V_FILE"
+  else
+    good "首次发布：v$V_FILE"
+  fi
+
+  # 2c. 宪法体积 —— 4 KB 是硬上限，不是建议
+  CN=$(wc -c < templates/constitution.md | tr -d ' ')
+  if [ "$CN" -le 4096 ]; then
+    good "宪法 ${CN} B ≤ 4096 B"
+  else
+    bad "宪法 ${CN} B 超 4 KB —— 先删一条再加（跑 /ratchet:slim）"
+  fi
+fi
+
+if [ "$FAIL" = "1" ]; then
+  echo
+  printf "\033[31m[pre-push] 已阻止推送到 %s\033[0m\n" "$REMOTE"
+  printf "           修好再推。确实要强推：git push --no-verify\n"
+  exit 1
+fi
+
+good "全部检查通过 → 放行"
+exit 0
