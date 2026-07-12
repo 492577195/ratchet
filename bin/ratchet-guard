@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+ratchet-guard — 危险动作拦截。PreToolUse hook（Claude Code 与 Codex 都支持）。
+
+纪律「可逆性」的硬门禁实现。原工程把它写成一条 CLAUDE.md 里的 YOU MUST，
+靠模型自觉；这里把它下沉成确定性代码 —— 模型绕不过去。
+
+两级：
+  deny — 不可逆且高危。直接拒绝，不给商量余地。
+  ask  — 可能危险。转人工确认。
+
+其中一类值得单独说：**Slopsquatting**（AI 幻觉依赖投毒）。
+模型为了让方案看起来合理，会虚构出根本不存在的包名（fastparserx 这种）。
+攻击者监控主流模型的幻觉偏好，抢先在 npm/PyPI 注册这些包名并植入恶意载荷。
+AI 一句 `npm install` 就中招，post-install 脚本在毫秒级窃取云凭据并外传。
+所以：**任何不在依赖清单里的包安装，一律转人工确认。**
+
+平台差异：CC 的工具叫 Bash，Codex 走 shell exec，工具名不同。
+因此本脚本**不依赖工具名**，只从 payload 里尽力提取命令文本。
+
+协议（两平台一致，P0 实测确认）：
+  stdin  : {"tool_name": "...", "tool_input": {...}}
+  stdout : {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+            "permissionDecision": "deny|ask", "permissionDecisionReason": "..."}}
+  放行时输出 {} 并 exit 0。**决策一律走 JSON body，不用退出码** —— 退出码非 0
+  会被平台当成 hook 自身故障，而不是「拒绝」。
+"""
+import json
+import os
+import re
+import sys
+
+# ── deny：不可逆的破坏 ───────────────────────────────────────────────
+DENY = [
+    (re.compile(r"\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR][a-zA-Z]*f|\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*f[a-zA-Z]*[rR]"),
+     "递归强制删除（rm -rf）。要删就明确列出路径，或让用户自己执行。"),
+    (re.compile(r"\bgit\s+push\b.*(--force\b(?!-with-lease)|(?<![\w-])-f(?![\w-]))"),
+     "git push --force 会覆写远端历史，不可逆。改用 --force-with-lease，或请用户确认。"),
+    (re.compile(r"\bgit\s+reset\s+--hard\b"),
+     "git reset --hard 会丢弃工作区改动，不可逆。先 stash 或 commit。"),
+    (re.compile(r"\bgit\s+checkout\s+--\s"),
+     "git checkout -- <path> 会丢弃该文件的所有未提交改动，不可逆。"),
+    (re.compile(r"\bgit\s+clean\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*f"),
+     "git clean -f 会删除未跟踪文件，不可逆。先 git clean -n 看看会删什么。"),
+    (re.compile(r">\s*/dev/(sd|disk|nvme)"),
+     "直接写块设备。"),
+    (re.compile(r"\bmkfs\b|\bdd\s+.*\bof=/dev/"),
+     "格式化 / 裸写磁盘。"),
+]
+
+# ── ask：可能危险，转人工 ────────────────────────────────────────────
+ASK = [
+    (re.compile(r"\bgit\s+push\b(?!.*--dry-run)"),
+     "push 是对外动作，请确认目标分支与远端。"),
+    (re.compile(r"\bgit\s+rebase\b|\bgit\s+filter-branch\b|\bgit\s+reflog\s+expire\b"),
+     "改写历史。"),
+    (re.compile(r"\bchmod\s+(-[a-zA-Z]+\s+)*777\b"),
+     "chmod 777 放开全部权限。"),
+    (re.compile(r"\bcurl\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b|\bwget\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b"),
+     "把网络内容直接管进 shell 执行 —— 无法审计执行了什么。先下载、看一眼、再跑。"),
+    (re.compile(r"\bsudo\b"),
+     "提权操作。"),
+]
+
+# ── Slopsquatting：依赖安装 ─────────────────────────────────────────
+INSTALL = re.compile(
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:install|add|i)\s+(?P<js>[^\s;&|]+)"
+    r"|\b(?:pip|pip3|uv\s+pip)\s+install\s+(?P<py>[^\s;&|]+)"
+)
+# 这些不是包名
+_NOT_PKG = re.compile(r"^-|^\.|/|^(?:git\+|https?:)")
+
+MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml", "Pipfile", "package-lock.json", "uv.lock")
+
+
+def declared_deps(root: str) -> str:
+    """把项目依赖清单读成一坨文本，用于判断包名是否是「已声明的」。"""
+    blob = []
+    for m in MANIFESTS:
+        p = os.path.join(root, m)
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                blob.append(fh.read())
+        except OSError:
+            pass
+    return "\n".join(blob)
+
+
+def check_install(cmd: str, root: str) -> str | None:
+    """返回 ask 理由；无风险返回 None。"""
+    deps = None
+    for m in INSTALL.finditer(cmd):
+        pkg = m.group("js") or m.group("py") or ""
+        if not pkg or _NOT_PKG.search(pkg):
+            continue
+        bare = re.split(r"[@=<>~^]", pkg.lstrip("@"), maxsplit=1)[0]
+        if not bare:
+            continue
+        if deps is None:
+            deps = declared_deps(root)
+        if re.search(rf'["\'/\s]{re.escape(bare)}["\'\s=<>~^@]', deps):
+            continue  # 依赖清单里有，是已声明的依赖
+        return (
+            f"安装了依赖清单里没有的包 `{bare}`。\n"
+            f"Slopsquatting 风险：模型会幻觉出不存在的包名，攻击者抢注同名恶意包，"
+            f"post-install 脚本可在毫秒级窃取本机凭据。\n"
+            f"请先确认 `{bare}` 确实存在、是你要的那个包、且维护者可信，再放行。"
+        )
+    return None
+
+
+def extract_command(payload: dict) -> str:
+    """从 payload 里尽力挖出命令文本。
+
+    不依赖工具名 —— CC 的工具叫 Bash，Codex 走 shell exec，字段也可能不同。
+    宁可多扫几个字段，也不要因为平台改了个键名就悄悄失效。
+    """
+    ti = payload.get("tool_input") or payload.get("input") or {}
+    if isinstance(ti, str):
+        return ti
+    if not isinstance(ti, dict):
+        return ""
+    for k in ("command", "cmd", "script", "shell_command"):
+        v = ti.get(k)
+        if isinstance(v, str) and v:
+            return v
+        if isinstance(v, list):
+            return " ".join(str(x) for x in v)
+    return ""
+
+
+def emit(decision: str | None, reason: str = "") -> int:
+    if decision is None:
+        print("{}")
+    else:
+        json.dump(
+            {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": decision,
+                "permissionDecisionReason": f"[ratchet-guard] {reason}",
+            }},
+            sys.stdout, ensure_ascii=False,
+        )
+        print()
+    return 0  # 决策走 JSON body，退出码恒 0（非 0 会被当成 hook 故障）
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return emit(None)  # 读不懂就放行，guard 不该把会话卡死
+
+    cmd = extract_command(payload)
+    if not cmd:
+        return emit(None)
+
+    root = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+
+    for pat, why in DENY:
+        if pat.search(cmd):
+            return emit("deny", why)
+
+    slop = check_install(cmd, root)
+    if slop:
+        return emit("ask", slop)
+
+    for pat, why in ASK:
+        if pat.search(cmd):
+            return emit("ask", why)
+
+    return emit(None)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
