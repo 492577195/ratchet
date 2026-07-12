@@ -146,6 +146,30 @@ expect allow "git resetting-branch-name"
 # force-with-lease 是安全强推，不该 deny（但 push 本身仍值得确认 → ask）
 expect ask "git push --force-with-lease origin feature"
 
+# ── 提到 ≠ 执行 ──────────────────────────────────────────────
+# 首版对整条命令原文做匹配，于是「只是提到危险串」的命令也被 deny：写文档、
+# 打补丁、grep 代码全被拦。动辄误拦的门禁会被用户直接关掉，那时保护等于零。
+# 溯源：dogfood 时 printf 一段含 rm -rf 的 prompt 到文件，被拦。
+expect allow "printf 'rm -rf /tmp/x' > /tmp/prompt.txt"
+expect allow "grep 'rm -rf' test/run.sh"
+expect allow 'git commit -m "fix rm -rf false positive"'
+expect allow "echo 'git push --force is dangerous' >> README.md"
+
+# ── 但绕过姿势一个都不能漏 ────────────────────────────────────
+# 这一栏是上面那格放宽的代价上限。漏拦比误拦严重得多：误拦只是碍事，
+# 漏拦是真的删数据。每放宽一寸，这里就要补一条。
+expect deny 'sh -c "rm -rf /"'                       # 解释器的参数就是代码
+expect deny "bash -c 'git reset --hard HEAD~3'"
+expect deny "python3 -c \"os.system('rm -rf /')\""   # 解释器不限于 shell
+expect deny 'echo "$(rm -rf /tmp/x)"'                # 命令替换里的东西会跑
+expect deny 'echo `rm -rf /tmp/x`'                   # 反引号同理
+expect deny "sudo rm -rf /var/log"                   # 包装器后面跟的是真命令
+expect deny "env FOO=1 rm -rf /tmp/x"
+expect deny "xargs rm -rf < list.txt"
+expect deny "ls && rm -rf /tmp/x"                    # 复合命令的后半段
+expect deny "ls; rm -rf /tmp/x"
+expect deny "rm -rf \"/tmp/my dir\""                 # 带空格的路径参数，仍是真删除
+
 # hook 输出必须是干净的 JSON —— 任何 warning/噪声混进流里都会污染平台解析
 out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm install ghostpkg"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard 2>&1)
 echo "$out" | grep -qi "warning\|traceback" && bad "guard 输出混入噪声" "$out" || ok "guard 输出干净无噪声"
