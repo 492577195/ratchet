@@ -12,6 +12,11 @@ bad()  { printf "  ❌ %s\n     %s\n" "$1" "${2:-}"; FAIL=$((FAIL+1)); }
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
+# 测试绝不能写本仓的运行时数据。开跑前记下指纹，收尾对账（见文件末尾 HYGIENE 段）。
+SELF_HITS=".ratchet/hits.jsonl"
+selfhits() { [ -f "$SELF_HITS" ] && shasum "$SELF_HITS" | cut -d' ' -f1 || echo absent; }
+SELF_HITS_BEFORE=$(selfhits)
+
 # ─────────────────────────────────────────────────────────────
 echo "K1 · 起手简报字节预算（≤ 2048 B，与项目年龄无关）"
 # ─────────────────────────────────────────────────────────────
@@ -92,10 +97,16 @@ fi
 echo
 echo "GUARD · 危险动作拦截"
 # ─────────────────────────────────────────────────────────────
+# cwd 必须是隔离沙箱，不能是 $PWD。guard 会按 cwd 找 .ratchet/ 并追加 hits.jsonl，
+# 而本仓自己装了 ratchet（P5 dogfood）—— 用 $PWD 会让每次跑测试都往真实命中日志里
+# 灌一遍假数据，`/ratchet:slim` 的减法依据随之失真。沙箱不建 .ratchet/，guard 直接跳过写入。
+# 「有 .ratchet 时确实会写 hits」由下方 $PJ 那条用例覆盖。
+GTMP=$(mktemp -d); trap 'rm -rf "$TMP" "$GTMP"' EXIT
+
 # decision <命令> -> deny|ask|allow
 decision() {
   printf '{"tool_name":"Bash","tool_input":{"command":%s},"cwd":"%s"}' \
-    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" "$PWD" \
+    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" "$GTMP" \
   | $BIN/ratchet-guard 2>/dev/null \
   | python3 -c 'import json,sys
 d=json.load(sys.stdin).get("hookSpecificOutput")
@@ -136,11 +147,11 @@ expect allow "git resetting-branch-name"
 expect ask "git push --force-with-lease origin feature"
 
 # hook 输出必须是干净的 JSON —— 任何 warning/噪声混进流里都会污染平台解析
-out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm install ghostpkg"},"cwd":"%s"}' "$PWD" | $BIN/ratchet-guard 2>&1)
+out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm install ghostpkg"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard 2>&1)
 echo "$out" | grep -qi "warning\|traceback" && bad "guard 输出混入噪声" "$out" || ok "guard 输出干净无噪声"
 
 # 决策必须走 JSON body，退出码恒 0（非 0 会被平台当成 hook 自身故障）
-printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"%s"}' "$PWD" | $BIN/ratchet-guard >/dev/null 2>&1
+printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard >/dev/null 2>&1
 [ $? -eq 0 ] && ok "deny 时退出码仍为 0（决策走 JSON，非退出码）" || bad "deny 时退出码非 0 —— 会被平台误判为 hook 故障"
 
 # ─────────────────────────────────────────────────────────────
@@ -245,7 +256,53 @@ keep=$(python3 -c "import json;print(json.load(open('$PJ/.ratchet/state.json'))[
 printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /x"},"cwd":"%s"}' "$PJ" | $BIN/ratchet-guard >/dev/null
 [ -f "$PJ/.ratchet/hits.jsonl" ] && ok "guard 命中写入 hits.jsonl（棘爪释放的数据基础）" || bad "未记录命中"
 $BIN/ratchet-audit --root "$PJ" >/dev/null 2>&1 && ok "ratchet-audit 可运行" || bad "ratchet-audit 失败"
+
+# 回归 · 热区 = 真正会进上下文的东西，不是「所有机制文件」。
+# .ratchet/constitution.md 不进上下文（AI 读 CLAUDE.md → @AGENTS.md，正文已在 AGENTS.md 里），
+# 它只是 plugin 产物副本，供 upgrade 做 diff。首版把它算进热区 → 同一份内容计两遍、
+# 虚报超支 489 B。dogfood 抓到的。
+hotout=$($BIN/ratchet-overhead --root "$PJ" 2>/dev/null)
+echo "$hotout" | sed -n '/热区（/,/冷区/p' | grep -q "constitution.md" \
+  && bad "constitution.md 被误算进热区（它不进上下文，会导致重复计数）" \
+  || ok "constitution.md 归入冷区（不进上下文，避免与 AGENTS.md 重复计数）"
 rm -rf "$PJ"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "STATE·HOOK · 输出协议（判得对，还得让平台听得见）"
+# ─────────────────────────────────────────────────────────────
+# 溯源：首版 emit_hook 凭 PreToolUse 的印象，给 PostToolUse 发了
+# hookSpecificOutput.permissionDecision —— 那是 PreToolUse 专用字段。平台不认识、
+# 静默丢弃，于是这道门禁**从未拒绝过任何东西**，schema 的 maxLength/maxItems 全是摆设。
+# 当时 47 条测试全绿：它们只断言了校验器判得对不对，没断言判完有没有人听得见。
+# 协议依据：https://code.claude.com/docs/en/hooks
+#   PreToolUse  → hookSpecificOutput.permissionDecision (allow/deny/ask)
+#   PostToolUse → 顶层 decision: "block" + reason
+# --hook 走的是真实 hook 通路：payload 从 stdin 进，file_path 必须落在 .ratchet/state.json。
+# 测试必须走这条通路，不能拿 --state 抄近路 —— 否则测的就不是平台实际会跑的那段代码。
+HKD="$TMP/hk/.ratchet"; mkdir -p "$HKD"; HK="$HKD/state.json"
+python3 -c "
+import json
+d = json.load(open('.ratchet/state.json'))
+d['current']['task'] = '超' * 60          # 60 字 > maxLength 50
+json.dump(d, open('$HK', 'w'), ensure_ascii=False)"
+hookpay() { printf '{"tool_name":"Edit","tool_input":{"file_path":"%s"},"cwd":"%s"}' "$1" "$TMP/hk"; }
+hookout=$(hookpay "$HK" | $BIN/ratchet-state --hook 2>/dev/null); hookrc=$?
+
+echo "$hookout" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("decision")=="block" and d.get("reason") else 1)' \
+  && ok "非法 state → 顶层 decision:block + reason（PostToolUse 协议）" \
+  || bad "非法 state 未按 PostToolUse 协议阻断" "$hookout"
+
+echo "$hookout" | grep -q "permissionDecision" \
+  && bad "PostToolUse 误用了 permissionDecision —— 那是 PreToolUse 专用字段，平台会静默丢弃" \
+  || ok "未误用 permissionDecision（PreToolUse 专用字段）"
+
+[ "$hookrc" -eq 0 ] && ok "阻断时退出码仍为 0（决策走 JSON，非退出码）" \
+  || bad "阻断时退出码非 0 —— 会被平台误判为 hook 自身故障"
+
+hookpay "$PWD/.ratchet/state.json" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decision" \
+  && bad "合法 state 竟然也阻断 —— 误伤会让用户直接关掉门禁" \
+  || ok "合法 state 静默放行"
 
 # ─────────────────────────────────────────────────────────────
 echo
@@ -257,6 +314,18 @@ $BIN/ratchet-context --transcript /nonexistent >/dev/null 2>&1 && ok "transcript
 echo '{}' > "$TMP/empty.json"
 $BIN/ratchet-brief --state "$TMP/empty.json" >/dev/null 2>&1
 [ $? -le 1 ] && ok "空 state 优雅降级" || bad "空 state 处理异常"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "HYGIENE · 测试不得污染本仓的运行时数据"
+# ─────────────────────────────────────────────────────────────
+# 溯源：P5 dogfood 给本仓装上 .ratchet/ 之后，GUARD 段的 cwd 还写着 $PWD，
+# 于是每跑一次测试就往真实 hits.jsonl 里灌 12 条假命中。hits 是 /ratchet:slim
+# 做减法的唯一依据 —— 假命中会让「零命中的规则删掉」判断失真，棘爪被自己的测试卡死。
+# 任何 hook 类测试新增用例时，cwd 必须指向沙箱；这条断言负责在你忘记时拦住你。
+[ "$(selfhits)" = "$SELF_HITS_BEFORE" ] \
+  && ok "测试未改动本仓 hits.jsonl（沙箱隔离生效）" \
+  || bad "测试污染了 $SELF_HITS —— 某个用例的 cwd 指向了本仓而非沙箱"
 
 echo
 echo "──────────────────────────────"
