@@ -1,0 +1,20 @@
+{
+  "name": "ratchet",
+  "interface": {
+    "displayName": "ratchet"
+  },
+  "plugins": [
+    {
+      "name": "ratchet",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-marketplace.json",
+  "name": "ratchet",
+  "owner": {
+    "name": "zhang"
+  },
+  "metadata": {
+    "description": "AI 协作工程脚手架",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "ratchet",
+      "source": "./",
+      "description": "把可机器化的工程纪律下沉为确定性门禁，并保证机制的上下文成本与项目年龄无关。",
+      "category": "productivity",
+      "tags": [
+        "scaffold",
+        "harness",
+        "discipline",
+        "context-management"
+      ],
+      "strict": false
+    }
+  ],
+  "version": "0.1.0"
+}
