@@ -95,14 +95,18 @@ status_line = ["model", "directory", "context-percent"]
 ## 组件
 
 ```
+bin/ratchet-init       铺脚手架到项目（确定性、幂等、永不覆写你的数据）
 bin/ratchet-brief      起手简报（state.json → ≤2 KB，SessionStart 注入）
 bin/ratchet-guard      危险动作拦截（PreToolUse）+ Slopsquatting 防护
 bin/ratchet-state      schema 校验（PostToolUse）—— K1/K4 的执行者
 bin/ratchet-digest     收尾自动留痕（SessionEnd）
 bin/ratchet-context    上下文占比（statusLine）
 bin/ratchet-overhead   机制税审计 —— 给脚手架自己做体检
+bin/ratchet-audit      减法审计 —— 棘爪释放的数据来源
 lib/transcript.py      transcript 共享解析器
-hooks/hooks.json       双平台共用
+hooks/hooks.json       双平台共用（一份两用）
+skills/                init · handoff · ratchet · slim
+templates/constitution.md   纪律基线（硬上限 4 KB）
 schema/state.schema.json
 ```
 
@@ -120,7 +124,7 @@ schema/state.schema.json
 ## 测试
 
 ```bash
-./test/run.sh     # 37 PASS
+./test/run.sh     # 45 PASS
 ```
 
 每个真实发生过的 bug 都在这里留下一条永远拦住它的断言。不写「下次注意」，写测试。
