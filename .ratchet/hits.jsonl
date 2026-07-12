@@ -1,8 +1,0 @@
-{"rule": "rm-rf", "decision": "deny", "at": "2026-07-12T11:32:35+00:00"}
-{"rule": "push", "decision": "ask", "at": "2026-07-12T11:41:09+00:00"}
-{"rule": "push", "decision": "ask", "at": "2026-07-12T11:42:00+00:00"}
-{"rule": "rm-rf", "decision": "deny", "at": "2026-07-12T11:54:30+00:00"}
-{"rule": "rm-rf", "decision": "deny", "at": "2026-07-12T11:55:53+00:00"}
-{"rule": "rm-rf", "decision": "deny", "at": "2026-07-12T11:57:15+00:00"}
-{"rule": "rm-rf", "decision": "deny", "at": "2026-07-12T12:11:42+00:00"}
-{"rule": "rm-rf", "decision": "deny", "at": "2026-07-12T12:12:23+00:00"}
