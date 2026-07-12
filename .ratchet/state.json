@@ -2,9 +2,9 @@
   "schema_version": 1,
   "preset": "complex",
   "current": {
-    "task": "P5 dogfood：验证发布闭环",
-    "next": "plugin update 后端到端验 B/C/D",
-    "iteration": "v0.1.1",
+    "task": "P5 dogfood：修掉 4 个真 bug",
+    "next": "建 ratchet-eval 独立仓",
+    "iteration": "v0.1.2",
     "stage": "testing"
   },
   "blocked": [
@@ -22,6 +22,11 @@
   "pending_user": [],
   "recent_decisions": [
     {
+      "decision": "开发用 --plugin-dir 跑 dev",
+      "why": "in-place 加载，零污染",
+      "date": "2026-07-12"
+    },
+    {
       "decision": "PostToolUse 用顶层 decision",
       "why": "该字段是 PreToolUse 专用",
       "date": "2026-07-12"
@@ -30,11 +35,6 @@
       "decision": "测试 cwd 必须用沙箱",
       "why": "否则污染真实 hits 数据",
       "date": "2026-07-12"
-    },
-    {
-      "decision": "真门禁放本地 pre-push",
-      "why": "Free 私有仓无 Rulesets",
-      "date": "2026-07-12"
     }
   ],
   "session": {
@@ -42,5 +42,5 @@
     "last_date": "2026-07-12",
     "log_written": true
   },
-  "updated_at": "2026-07-12T11:45:00+00:00"
+  "updated_at": "2026-07-12T12:20:00+00:00"
 }

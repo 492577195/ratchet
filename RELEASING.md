@@ -10,6 +10,34 @@ fix/*   hotfix：从 main 切，合回 main，再把 main 合回 dev
 
 不用 Git Flow 的 release/hotfix 分支——单人项目上那是纯仪式负担，正是 ratchet 反对的「机制吃掉任务」。
 
+## 开发时怎么验：`--plugin-dir`
+
+**别为了验证而先合并 main。** 那会把没验过的代码推给所有项目——user-scope 的 plugin 在你每个仓里都活着。
+
+```bash
+cd /path/to/ratchet
+claude --plugin-dir .      # 用当前工作树（dev 分支）起一个会话
+```
+
+| | |
+|---|---|
+| **session only** | 只影响这一次启动的会话，不写任何全局配置 |
+| **in-place** | 只有 *marketplace* plugin 才拷贝进 `~/.claude/plugins/cache`。`--plugin-dir` 直接读目录——改完代码重启会话即生效，不用 bump version、不用 push |
+| **不双注册** | 同名的 user-scope plugin 被覆盖，不是叠加。实测：一次 deny 只记一条 hit |
+| **零污染** | 其他项目继续用 main 的稳定版 |
+
+于是流程是：
+
+```
+dev + claude --plugin-dir .   ← 真实环境里随便崩
+        ↓ 验过了
+merge main → pre-push 门禁 → tag → /plugin update   ← 只有绿的才出门
+```
+
+**为什么必须真的起一个会话，而不是跑测试就算数**：v0.1.1 之前有四个 bug，47 条单元测试一个都没抓到——测试测的是「脚本算得对不对」，抓不到「平台认不认这个 hook 输出格式」。那类 bug 只有真跑才现形。
+
+> 排查技巧：想确认加载的到底是工作树那份还是 cache 那份，往工作树的代码里塞一个唯一记号（如 `[DEV-PROBE-xxxx]`），跑一次看输出里有没有它。别靠猜。
+
 ## 门禁在哪
 
 **GitHub Rulesets 需要 Team/Enterprise 计划，Free 用不了。** 所以 GitHub **不会**替你拦住任何东西——CI 能报红，但拦不住合并。
