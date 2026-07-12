@@ -1,3 +1,9 @@
 .DS_Store
 *.pyc
 __pycache__/
+
+# guard 的命中记录 —— 运行时数据，不该进版本库。
+# 它需要持久化在本地供 /ratchet:slim 做减法，但没有理由跟着代码走：
+#   · 每次会话都在变，切分支时挡路（真踩过：checkout 直接 Aborting）
+#   · 跟着走会让 clone 的人拿到**别人的**命中记录，污染自己的减法依据
+.ratchet/hits.jsonl
