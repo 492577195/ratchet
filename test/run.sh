@@ -145,6 +145,61 @@ printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"%s"}' "$P
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "HOOKS · 双平台配置与协议"
+# ─────────────────────────────────────────────────────────────
+# Codex 的解析器会因任何未知顶层字段拒绝整份 hooks.json 并静默丢弃全部 hook。
+# 这正是 mppm 线上的真实故障：顶层的 $schema/_comment 让它在 Codex 上全员失效。
+top=$(python3 -c "import json;print(','.join(sorted(json.load(open('hooks/hooks.json')).keys())))")
+[ "$top" = "description,hooks" ] && ok "hooks.json 顶层仅 description/hooks（Codex 可解析）" \
+  || bad "hooks.json 顶层含 Codex 不接受的字段" "$top"
+
+# matcher 必须留空：CC 的工具叫 Bash，Codex 走 shell exec，写死工具名会在 Codex 静默失效
+nonempty=$(python3 -c "
+import json
+d=json.load(open('hooks/hooks.json'))['hooks']
+print(sum(1 for evs in d.values() for e in evs if e.get('matcher')))")
+[ "$nonempty" = "0" ] && ok "matcher 全部留空（跨平台安全，过滤交给脚本）" \
+  || bad "有 $nonempty 处写死了 matcher —— 会在 Codex 上失效"
+
+# 门禁必须同步执行，异步的门禁拦不住任何东西
+asy=$(python3 -c "
+import json
+d=json.load(open('hooks/hooks.json'))['hooks']
+print(sum(1 for ev in ('PreToolUse','PostToolUse') for e in d.get(ev,[])
+          for h in e['hooks'] if h.get('async')))")
+[ "$asy" = "0" ] && ok "Pre/PostToolUse 均为同步（async 的门禁形同虚设）" || bad "有异步门禁"
+
+# 未 init 的项目里，SessionStart 必须完全闭嘴 —— plugin 是全局安装的，
+# 一个到处刷存在感的 hook 会被用户直接卸载，那时保护等于零。
+out=$(echo '{}' | $BIN/ratchet-brief --hook --state /nonexistent/state.json)
+[ "$out" = "{}" ] && ok "非 ratchet 项目中 SessionStart 静默" || bad "非 ratchet 项目仍有输出" "$out"
+
+# SessionEnd → 自动留痕 → state.log_written=false → 下次起手提醒补写
+PROJ=$(mktemp -d); mkdir -p "$PROJ/.ratchet"
+cat > "$PROJ/.ratchet/state.json" <<EOF
+{"schema_version":1,"preset":"standard","current":{"task":"t","next":"n"},
+ "session":{"last":3,"last_date":"2026-07-12","log_written":true},
+ "updated_at":"2026-07-12T09:00:00Z"}
+EOF
+python3 -c "
+import json,sys
+rec={'type':'assistant','message':{'model':'claude-opus-4-8','usage':{'input_tokens':5,'output_tokens':9},
+ 'content':[{'type':'tool_use','name':'Bash','input':{'command':'pytest -q'}}]}}
+open(sys.argv[1],'w').write(json.dumps(rec)+chr(10))" "$PROJ/t.jsonl"
+printf '{"transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
+[ -f "$PROJ/.ratchet/log/"*"-s4.md" ] 2>/dev/null && ok "SessionEnd 自动生成 s-4 日志草稿" || bad "未生成日志草稿"
+lw=$(python3 -c "import json;print(json.load(open('$PROJ/.ratchet/state.json'))['session']['log_written'])")
+[ "$lw" = "False" ] && ok "log_written 置为 false（决策段待补）" || bad "log_written 未置位"
+$BIN/ratchet-brief --state "$PROJ/.ratchet/state.json" | grep -q "日志未写" \
+  && ok "下次起手简报顶出「日志未写」提醒（留痕不靠模型记性）" || bad "简报未提醒补写日志"
+# 幂等：resume 重复触发不该覆盖已写的日志
+printf '{"transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
+cnt=$(ls "$PROJ/.ratchet/log/" | wc -l | tr -d ' ')
+[ "$cnt" -le 2 ] && ok "重复触发不覆盖已有日志（resume 安全）" || bad "重复触发产生了 $cnt 份日志"
+rm -rf "$PROJ"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "ROBUSTNESS · 坏输入绝不能让 hook 崩掉"
 # ─────────────────────────────────────────────────────────────
 printf 'not json\n{"type":"assistant"}\n' > "$TMP/bad.jsonl"

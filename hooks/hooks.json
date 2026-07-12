@@ -1,0 +1,61 @@
+{
+  "description": "ratchet hooks — Claude Code 与 Codex 共用同一份配置。顶层只允许 description 与 hooks 两个键：Codex 的解析器会因任何未知顶层字段（$schema / _comment 等）拒绝整个文件并静默丢弃全部 hook。嵌套层的自定义键（_purpose）两边都容忍。matcher 一律留空：CC 的工具叫 Bash，Codex 走 shell exec，工具名不同，写死 matcher 会在 Codex 上悄悄失效 —— 粗筛交给 matcher，真正的过滤在脚本里做。command 用 ${CLAUDE_PLUGIN_ROOT}，Codex 也注入这个别名。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "_purpose": "起手简报注入。由 state.json 渲染，硬上限 2 KB，不随项目年龄增长。取代『让模型自己去读一堆文件』的起手仪式 —— 那个做法在原工程里长成了 247 KB。",
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/ratchet-brief --hook",
+            "timeout": 5,
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "_purpose": "危险动作拦截。纪律『可逆性』的硬门禁：rm -rf / push --force / reset --hard 直接 deny；依赖清单外的包安装转人工（Slopsquatting 防护）。必须 async:false —— 异步的门禁拦不住任何东西。",
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/ratchet-guard",
+            "timeout": 5,
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "_purpose": "state.json 写入后立即校验 schema。K1/K4 的执行者：maxItems/maxLength 写在 schema 里不产生约束力，必须有人在写入时真的拒绝，否则 state 会慢慢长胖、简报跟着膨胀。脚本自己判断改的是不是 state.json，不是 state.json 就静默放行。",
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/ratchet-state --hook",
+            "timeout": 5,
+            "async": false
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "_purpose": "收尾自动留痕（K2）。从 transcript 抽出机械事实（改了哪些文件/跑了哪些命令/token 用量）写入日志草稿，并把 state.session.log_written 置为 false。模型下次起手会被提示补写『决策与教训』那一段 —— 机器写得出来的，不该占用模型的推理算力。",
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/ratchet-digest --hook",
+            "timeout": 10,
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -75,11 +75,29 @@ def render(st):
     return "\n".join(L) + "\n"
 
 
+def emit_hook(text: str) -> int:
+    """SessionStart hook：把简报注入上下文。
+
+    未 init 的项目一律输出 {} 静默退出 —— plugin 装在全局，会在每个项目启动。
+    一个到处刷存在感的 hook 会被用户直接卸载，那时保护等于零。
+    """
+    if text:
+        json.dump(
+            {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}},
+            sys.stdout, ensure_ascii=False,
+        )
+        print()
+    else:
+        print("{}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--state")
     ap.add_argument("--budget", type=int, default=BUDGET)
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--hook", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args()
     if a.help:
@@ -88,11 +106,15 @@ def main():
 
     path = find_state(a.state)
     if not os.path.isfile(path):
+        if a.hook:
+            return emit_hook("")  # 非 ratchet 项目：闭嘴
         print(f"ratchet: 未找到 {path}（先跑 /ratchet:init）", file=sys.stderr)
         return 1
     try:
         st = json.load(open(path, encoding="utf-8"))
     except json.JSONDecodeError as e:
+        if a.hook:
+            return emit_hook(f"⚠️ .ratchet/state.json 不是合法 JSON（{e}）—— 先修好它。")
         print(f"ratchet: state.json 非法 JSON — {e}", file=sys.stderr)
         return 1
 
@@ -100,12 +122,18 @@ def main():
     n = len(out.encode("utf-8"))
 
     if n > a.budget:
-        print(
-            f"ratchet: 简报 {n} B 超出预算 {a.budget} B（K1 被破坏）。"
-            f"schema 的 maxItems/maxLength 应已阻止这种情况 —— 检查 state.json 是否绕过了 schema 校验。",
-            file=sys.stderr,
+        msg = (
+            f"简报 {n} B 超出预算 {a.budget} B（K1 被破坏）。"
+            f"schema 的 maxItems/maxLength 应已阻止这种情况 —— 检查 state.json 是否绕过了 schema 校验。"
         )
+        if a.hook:
+            # 超预算时宁可截断也要注入 —— 但必须把「机制坏了」这件事明说出来
+            return emit_hook(out[: a.budget] + f"\n\n⚠️ {msg}")
+        print(f"ratchet: {msg}", file=sys.stderr)
         return 2
+
+    if a.hook:
+        return emit_hook(out)
 
     if a.check:
         print(f"ok: {n}/{a.budget} B ({n * 100 // a.budget}% of K1 budget)")

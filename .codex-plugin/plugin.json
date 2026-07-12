@@ -1,0 +1,36 @@
+{
+  "name": "ratchet",
+  "version": "0.1.0",
+  "description": "AI 协作工程脚手架。把可机器化的工程纪律下沉为确定性门禁，并保证机制的上下文成本与项目年龄无关。",
+  "author": {
+    "name": "zhang"
+  },
+  "license": "MIT",
+  "keywords": [
+    "scaffold",
+    "harness",
+    "discipline",
+    "hooks",
+    "context-management"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ratchet",
+    "shortDescription": "工程纪律的确定性门禁 + 上下文成本 O(1)",
+    "longDescription": "把「不闷头干 / 可逆性 / 工作留痕 / 上下文卫生」这类工程纪律，从 CLAUDE.md 里靠模型自觉遵守的文字规则，下沉为 hook 层的确定性门禁。同时保证机制自身的上下文开销恒定：起手简报由结构化 state 渲染且硬上限 2 KB，历史全部归档、只可检索不自动加载 —— 项目跑三年，起手成本与第一天相同。棘轮原则：每次失败转化为永久物理约束（/ratchet），并配套减法机制（/slim）防止约束本身膨胀。",
+    "developerName": "zhang",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "初始化这个项目的工程脚手架",
+      "生成本次会话的交接文件",
+      "审计一下机制本身的开销"
+    ],
+    "brandColor": "#B45309",
+    "screenshots": []
+  }
+}
