@@ -62,9 +62,13 @@ def main() -> int:
 
     hot, cold = {}, {}
 
-    # 热区：宪法 + 规则 + state（简报由 state 渲染，另算）
-    for rel in (".ratchet/constitution.md", ".ratchet/state.json", ".ratchet/config.json",
-                "CLAUDE.md", "AGENTS.md"):
+    # 热区 = **真正会进上下文**的东西，不是「所有机制文件」。
+    #
+    # 注意 .ratchet/constitution.md **不在**热区：AI 读的是 CLAUDE.md → @AGENTS.md，
+    # 而 AGENTS.md 已经包含了完整的纪律正文。constitution.md 只是 plugin 产物的
+    # 副本，留着给 upgrade 做 diff —— 没有任何模型会去读它。
+    # （首版把它算进热区，导致同一份内容被计两遍、虚报超支 489 B。dogfood 抓到的。）
+    for rel in (".ratchet/state.json", ".ratchet/config.json", "CLAUDE.md", "AGENTS.md"):
         p = os.path.join(root, rel)
         if os.path.isfile(p):
             hot[rel] = size(p)
@@ -84,12 +88,16 @@ def main() -> int:
         rel = os.path.relpath(p, root)
         (hot if i < RECENT_LOGS else cold)[rel] = size(p)
 
-    # 冷区：计划 / 迭代 / 修订 —— 想多大多大，不进上下文
+    # 冷区：归档 + plugin 产物副本 —— 不进上下文，想多大多大
     for base in ("PLAN", "iterations", ".ratchet/archive"):
         d = os.path.join(root, base)
         if os.path.isdir(d):
             for p in walk(d):
                 cold[os.path.relpath(p, root)] = size(p)
+    for rel in (".ratchet/constitution.md", ".ratchet/hits.jsonl"):
+        p = os.path.join(root, rel)
+        if os.path.isfile(p):
+            cold[rel] = size(p)
 
     hot_total, cold_total = sum(hot.values()), sum(cold.values())
 

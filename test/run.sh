@@ -245,6 +245,15 @@ keep=$(python3 -c "import json;print(json.load(open('$PJ/.ratchet/state.json'))[
 printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /x"},"cwd":"%s"}' "$PJ" | $BIN/ratchet-guard >/dev/null
 [ -f "$PJ/.ratchet/hits.jsonl" ] && ok "guard 命中写入 hits.jsonl（棘爪释放的数据基础）" || bad "未记录命中"
 $BIN/ratchet-audit --root "$PJ" >/dev/null 2>&1 && ok "ratchet-audit 可运行" || bad "ratchet-audit 失败"
+
+# 回归 · 热区 = 真正会进上下文的东西，不是「所有机制文件」。
+# .ratchet/constitution.md 不进上下文（AI 读 CLAUDE.md → @AGENTS.md，正文已在 AGENTS.md 里），
+# 它只是 plugin 产物副本，供 upgrade 做 diff。首版把它算进热区 → 同一份内容计两遍、
+# 虚报超支 489 B。dogfood 抓到的。
+hotout=$($BIN/ratchet-overhead --root "$PJ" 2>/dev/null)
+echo "$hotout" | sed -n '/热区（/,/冷区/p' | grep -q "constitution.md" \
+  && bad "constitution.md 被误算进热区（它不进上下文，会导致重复计数）" \
+  || ok "constitution.md 归入冷区（不进上下文，避免与 AGENTS.md 重复计数）"
 rm -rf "$PJ"
 
 # ─────────────────────────────────────────────────────────────
