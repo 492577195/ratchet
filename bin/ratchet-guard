@@ -29,6 +29,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import sys
 
 # 每条规则带 id —— 命中会被记录，供 /ratchet:slim 做减法审计。
@@ -126,6 +127,61 @@ def check_install(cmd: str, root: str) -> str | None:
     return None
 
 
+# 这些命令会把参数当代码执行 —— 危险串藏在它们的参数里，就是真的要跑。
+# 包装器（env/xargs/time/nohup/sudo）后面跟的是真命令，同样按原文看。
+INTERPRETERS = {
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "eval",
+    "python", "python3", "node", "ruby", "perl", "php",
+    "env", "xargs", "time", "nohup", "sudo", "ssh", "docker",
+}
+
+
+def scan_text(cmd: str) -> str:
+    """返回真正用于危险模式匹配的文本。
+
+    首版对整条命令原文做匹配，于是 `printf 'rm -rf x' > f` 这种只是**提到**危险串、
+    根本不执行它的命令也被 deny —— 写文档、打补丁、grep 代码全会被拦。
+    动辄误拦的门禁会被用户直接关掉，那时保护等于零。
+
+    但漏拦远比误拦严重，所以这里只收窄一格，其余一律保守回退到原文：
+      - heredoc（<<）           → 原文。内容会被喂进解释器执行，看不进去
+      - 引号不闭合 / 切词失败    → 原文。看不懂就别自作聪明
+      - 命令位是解释器或包装器   → 原文。它们的参数就是要执行的代码
+      - 普通命令（printf/grep…）→ 剔除「被引号包起来的字面量」再匹配
+
+    唯一放行的，是危险串纯粹作为普通命令的引号字符串参数出现。
+    含命令替换（$(…) / 反引号）的 token 不剔除 —— 那里面的东西是会跑的。
+    """
+    if "<<" in cmd:
+        return cmd
+
+    # 分隔符必须原样留在重建结果里 —— curl-pipe-sh 这类规则正是靠管道符识别的，
+    # 切掉分隔符会让它们悄悄失效（首版这么写，`curl … | sh` 直接从 ask 掉成 allow）。
+    out = []
+    for sc in re.split(r"(\|\||&&|[;|&\n])", cmd):
+        if re.fullmatch(r"\|\||&&|[;|&\n]", sc or ""):
+            out.append(sc)          # 分隔符原样保留
+            continue
+        sc = (sc or "").strip()
+        if not sc:
+            continue
+        try:
+            toks = shlex.split(sc)
+        except ValueError:
+            out.append(sc)          # 引号不闭合 → 保守
+            continue
+        if not toks:
+            continue
+        if os.path.basename(toks[0]) in INTERPRETERS:
+            out.append(sc)          # 参数即代码 → 保守
+            continue
+        out.append(" ".join(
+            t for t in toks
+            if not re.search(r"\s", t) or re.search(r"\$\(|`", t)
+        ))
+    return " ".join(out)
+
+
 def extract_command(payload: dict) -> str:
     """从 payload 里尽力挖出命令文本。
 
@@ -203,17 +259,18 @@ def main() -> int:
         return emit(None)
 
     root = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    scan = scan_text(cmd)
 
     for rid, pat, why in DENY:
-        if pat.search(cmd):
+        if pat.search(scan):
             return emit("deny", why, rid, root)
 
-    slop = check_install(cmd, root)
+    slop = check_install(scan, root)
     if slop:
         return emit("ask", slop, "slopsquatting", root)
 
     for rid, pat, why in ASK:
-        if pat.search(cmd):
+        if pat.search(scan):
             return emit("ask", why, rid, root)
 
     return emit(None)

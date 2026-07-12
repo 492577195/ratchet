@@ -146,6 +146,30 @@ expect allow "git resetting-branch-name"
 # force-with-lease 是安全强推，不该 deny（但 push 本身仍值得确认 → ask）
 expect ask "git push --force-with-lease origin feature"
 
+# ── 提到 ≠ 执行 ──────────────────────────────────────────────
+# 首版对整条命令原文做匹配，于是「只是提到危险串」的命令也被 deny：写文档、
+# 打补丁、grep 代码全被拦。动辄误拦的门禁会被用户直接关掉，那时保护等于零。
+# 溯源：dogfood 时 printf 一段含 rm -rf 的 prompt 到文件，被拦。
+expect allow "printf 'rm -rf /tmp/x' > /tmp/prompt.txt"
+expect allow "grep 'rm -rf' test/run.sh"
+expect allow 'git commit -m "fix rm -rf false positive"'
+expect allow "echo 'git push --force is dangerous' >> README.md"
+
+# ── 但绕过姿势一个都不能漏 ────────────────────────────────────
+# 这一栏是上面那格放宽的代价上限。漏拦比误拦严重得多：误拦只是碍事，
+# 漏拦是真的删数据。每放宽一寸，这里就要补一条。
+expect deny 'sh -c "rm -rf /"'                       # 解释器的参数就是代码
+expect deny "bash -c 'git reset --hard HEAD~3'"
+expect deny "python3 -c \"os.system('rm -rf /')\""   # 解释器不限于 shell
+expect deny 'echo "$(rm -rf /tmp/x)"'                # 命令替换里的东西会跑
+expect deny 'echo `rm -rf /tmp/x`'                   # 反引号同理
+expect deny "sudo rm -rf /var/log"                   # 包装器后面跟的是真命令
+expect deny "env FOO=1 rm -rf /tmp/x"
+expect deny "xargs rm -rf < list.txt"
+expect deny "ls && rm -rf /tmp/x"                    # 复合命令的后半段
+expect deny "ls; rm -rf /tmp/x"
+expect deny "rm -rf \"/tmp/my dir\""                 # 带空格的路径参数，仍是真删除
+
 # hook 输出必须是干净的 JSON —— 任何 warning/噪声混进流里都会污染平台解析
 out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm install ghostpkg"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard 2>&1)
 echo "$out" | grep -qi "warning\|traceback" && bad "guard 输出混入噪声" "$out" || ok "guard 输出干净无噪声"
@@ -303,6 +327,51 @@ echo "$hookout" | grep -q "permissionDecision" \
 hookpay "$PWD/.ratchet/state.json" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decision" \
   && bad "合法 state 竟然也阻断 —— 误伤会让用户直接关掉门禁" \
   || ok "合法 state 静默放行"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "HOOK·协议 · 每个事件只准说平台听得懂的话"
+# ─────────────────────────────────────────────────────────────
+# 同一个病根，本项目已经栽了两次：凭印象写 hook 输出格式。
+#   1. PostToolUse 误用 permissionDecision（PreToolUse 专用）→ 静默丢弃，门禁从未生效
+#   2. SessionEnd  误用 hookSpecificOutput.additionalContext → 平台校验失败，每次收尾喷红字
+# 单元测试抓不到这类 bug，因为它们测的是「脚本算得对不对」，不是「平台认不认」。
+# 这一段按事件逐个钉死输出格式。依据 https://code.claude.com/docs/en/hooks：
+#   SessionStart → hookSpecificOutput.additionalContext ✅（可注入上下文）
+#   SessionEnd   → 无 decision control，禁 hookSpecificOutput，只认 universal 字段
+#                  （continue / stopReason / suppressOutput / systemMessage / terminalSequence）
+UNIVERSAL='continue stopReason suppressOutput systemMessage terminalSequence'
+
+# SessionEnd（digest）：必须落盘，且绝不能吐 hookSpecificOutput
+DG="$TMP/dg"; mkdir -p "$DG"
+$BIN/ratchet-init --preset standard --root "$DG" >/dev/null 2>&1
+dgout=$(printf '{"cwd":"%s","transcript_path":"%s"}' "$DG" "$TMP/cmd.jsonl" | $BIN/ratchet-digest --hook 2>/dev/null)
+
+echo "$dgout" | grep -q "hookSpecificOutput" \
+  && bad "SessionEnd 吐了 hookSpecificOutput —— 平台会校验失败（Invalid input）" "$dgout" \
+  || ok "SessionEnd 未吐 hookSpecificOutput（它没有 decision control）"
+
+echo "$dgout" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+allowed = set('$UNIVERSAL'.split())
+sys.exit(0 if set(d) <= allowed else 1)" \
+  && ok "SessionEnd 输出只含 universal 字段" \
+  || bad "SessionEnd 出现了非 universal 字段 —— 平台会拒绝整份输出" "$dgout"
+
+ls "$DG/.ratchet/log/"*.md >/dev/null 2>&1 \
+  && ok "SessionEnd 真的落了日志草稿（收尾留痕的本体）" \
+  || bad "SessionEnd 没落盘 —— 收尾留痕失效"
+
+# SessionStart（brief）：这个事件**允许** hookSpecificOutput，别改错了方向
+btext=$(CLAUDE_PROJECT_DIR="$DG" $BIN/ratchet-brief --hook 2>/dev/null)
+echo "$btext" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+h = d.get('hookSpecificOutput') or {}
+sys.exit(0 if not d or (h.get('hookEventName') == 'SessionStart' and 'additionalContext' in h) else 1)" \
+  && ok "SessionStart 用 hookSpecificOutput.additionalContext（该事件支持注入）" \
+  || bad "SessionStart 输出不符协议" "$btext"
 
 # ─────────────────────────────────────────────────────────────
 echo

@@ -152,11 +152,17 @@ def run_hook(payload: dict) -> int:
     with open(state_p, "w", encoding="utf-8") as fh:
         json.dump(st, fh, ensure_ascii=False, indent=2)
 
+    # SessionEnd 没有 decision control，也不接受 hookSpecificOutput / additionalContext ——
+    # 它是纯副作用事件，只认 universal 字段（systemMessage / suppressOutput / …）。
+    # 见 https://code.claude.com/docs/en/hooks
+    #
+    # 首版吐了 hookSpecificOutput.additionalContext，平台校验直接失败：
+    #   SessionEnd hook failed: Hook JSON output validation failed — (root): Invalid input
+    # 日志其实落盘了（副作用在这行之前就发生了），但每次收尾都往用户终端喷一行红字。
+    # 这是本项目第二次栽在「凭印象写 hook 输出协议」上（第一次是 PostToolUse 误用
+    # permissionDecision）—— 所以现在每个 hook 事件的输出格式都有测试钉死。
     json.dump(
-        {"hookSpecificOutput": {
-            "hookEventName": "SessionEnd",
-            "additionalContext": f"[ratchet] 已生成 s-{n} 日志草稿：{os.path.relpath(fp, root)}（决策段待补）",
-        }},
+        {"systemMessage": f"[ratchet] 已生成 s-{n} 日志草稿：{os.path.relpath(fp, root)}（决策段待补）"},
         sys.stdout, ensure_ascii=False,
     )
     print()
