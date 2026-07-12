@@ -12,6 +12,11 @@ bad()  { printf "  ❌ %s\n     %s\n" "$1" "${2:-}"; FAIL=$((FAIL+1)); }
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
+# 测试绝不能写本仓的运行时数据。开跑前记下指纹，收尾对账（见文件末尾 HYGIENE 段）。
+SELF_HITS=".ratchet/hits.jsonl"
+selfhits() { [ -f "$SELF_HITS" ] && shasum "$SELF_HITS" | cut -d' ' -f1 || echo absent; }
+SELF_HITS_BEFORE=$(selfhits)
+
 # ─────────────────────────────────────────────────────────────
 echo "K1 · 起手简报字节预算（≤ 2048 B，与项目年龄无关）"
 # ─────────────────────────────────────────────────────────────
@@ -92,10 +97,16 @@ fi
 echo
 echo "GUARD · 危险动作拦截"
 # ─────────────────────────────────────────────────────────────
+# cwd 必须是隔离沙箱，不能是 $PWD。guard 会按 cwd 找 .ratchet/ 并追加 hits.jsonl，
+# 而本仓自己装了 ratchet（P5 dogfood）—— 用 $PWD 会让每次跑测试都往真实命中日志里
+# 灌一遍假数据，`/ratchet:slim` 的减法依据随之失真。沙箱不建 .ratchet/，guard 直接跳过写入。
+# 「有 .ratchet 时确实会写 hits」由下方 $PJ 那条用例覆盖。
+GTMP=$(mktemp -d); trap 'rm -rf "$TMP" "$GTMP"' EXIT
+
 # decision <命令> -> deny|ask|allow
 decision() {
   printf '{"tool_name":"Bash","tool_input":{"command":%s},"cwd":"%s"}' \
-    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" "$PWD" \
+    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" "$GTMP" \
   | $BIN/ratchet-guard 2>/dev/null \
   | python3 -c 'import json,sys
 d=json.load(sys.stdin).get("hookSpecificOutput")
@@ -136,11 +147,11 @@ expect allow "git resetting-branch-name"
 expect ask "git push --force-with-lease origin feature"
 
 # hook 输出必须是干净的 JSON —— 任何 warning/噪声混进流里都会污染平台解析
-out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm install ghostpkg"},"cwd":"%s"}' "$PWD" | $BIN/ratchet-guard 2>&1)
+out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm install ghostpkg"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard 2>&1)
 echo "$out" | grep -qi "warning\|traceback" && bad "guard 输出混入噪声" "$out" || ok "guard 输出干净无噪声"
 
 # 决策必须走 JSON body，退出码恒 0（非 0 会被平台当成 hook 自身故障）
-printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"%s"}' "$PWD" | $BIN/ratchet-guard >/dev/null 2>&1
+printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard >/dev/null 2>&1
 [ $? -eq 0 ] && ok "deny 时退出码仍为 0（决策走 JSON，非退出码）" || bad "deny 时退出码非 0 —— 会被平台误判为 hook 故障"
 
 # ─────────────────────────────────────────────────────────────
@@ -266,6 +277,18 @@ $BIN/ratchet-context --transcript /nonexistent >/dev/null 2>&1 && ok "transcript
 echo '{}' > "$TMP/empty.json"
 $BIN/ratchet-brief --state "$TMP/empty.json" >/dev/null 2>&1
 [ $? -le 1 ] && ok "空 state 优雅降级" || bad "空 state 处理异常"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "HYGIENE · 测试不得污染本仓的运行时数据"
+# ─────────────────────────────────────────────────────────────
+# 溯源：P5 dogfood 给本仓装上 .ratchet/ 之后，GUARD 段的 cwd 还写着 $PWD，
+# 于是每跑一次测试就往真实 hits.jsonl 里灌 12 条假命中。hits 是 /ratchet:slim
+# 做减法的唯一依据 —— 假命中会让「零命中的规则删掉」判断失真，棘爪被自己的测试卡死。
+# 任何 hook 类测试新增用例时，cwd 必须指向沙箱；这条断言负责在你忘记时拦住你。
+[ "$(selfhits)" = "$SELF_HITS_BEFORE" ] \
+  && ok "测试未改动本仓 hits.jsonl（沙箱隔离生效）" \
+  || bad "测试污染了 $SELF_HITS —— 某个用例的 cwd 指向了本仓而非沙箱"
 
 echo
 echo "──────────────────────────────"
