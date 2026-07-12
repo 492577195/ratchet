@@ -226,15 +226,42 @@ GIT_WRITE = re.compile(r"\bgit\b[^;|&]*\b(commit|add|checkout|reset|restore|appl
 
 
 def readonly_roots(root: str) -> list[str]:
+    cfg = os.path.join(root, ".ratchet", "config.json")
     try:
-        with open(os.path.join(root, ".ratchet", "config.json"), encoding="utf-8") as fh:
+        with open(cfg, encoding="utf-8") as fh:
             paths = json.load(fh).get("readonly_paths") or []
     except (OSError, json.JSONDecodeError, AttributeError):
         return []
+
     out = []
     for p in paths:
         if isinstance(p, str) and p:
             out.append(os.path.realpath(os.path.join(root, os.path.expanduser(p))))
+
+    # 自封：声明了只读区，这份配置自己也就成了只读区。
+    #
+    # 首版漏了这条 —— 只读区保护了判据，却没保护自己。AI 只要把 config.json 里的
+    # readonly_paths 删掉，约束就没了，然后回头随便改判据。实测四种姿势全部得手：
+    # Write 覆盖、Edit 改键名、重定向覆盖，一个没拦住。
+    #
+    # 一个 AI 能自行解除的约束，等于没有约束。
+    #
+    # 用户仍然改得动：手动编辑文件不经过 hook。挡的是 AI 的工具调用。
+    if out:
+        out.append(os.path.realpath(cfg))
+
+        # 门禁自己也得锁上。
+        #
+        # 只锁掉 config 是不够的：AI 可以绕开配置，直接把 plugin cache 里的
+        # ratchet-guard 覆盖成一个永远放行的空壳 —— 下次会话所有约束一起消失。
+        # 那是最直接的攻击面，而且成本极低。
+        #
+        # 只在 guard 跑自 plugin cache 时锁（即「已安装」的那份）。
+        # 用 --plugin-dir 指向工作树的开发模式不锁 —— 否则没法开发 ratchet 自己。
+        me = os.path.realpath(__file__)
+        if os.sep + ".claude" + os.sep + "plugins" + os.sep in me:
+            out.append(os.path.dirname(os.path.dirname(me)))  # plugin 根目录
+
     return out
 
 
