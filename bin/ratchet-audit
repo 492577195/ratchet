@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""
+ratchet-audit — 减法审计。棘爪释放的数据来源。
+
+棘轮原则（每次失败转化为永久约束）有个致命副作用：**它只进不退**。
+跑三年就是几百条规则、几十个校验器。规则膨胀 → 上下文稀释 → 注意力分散
+→ 规则更容易被忽略 → 再加规则。这正是它本来要治的病。
+
+所以棘轮必须配棘爪。这个脚本提供做减法所需的事实：
+
+  化石规则   长期零命中 —— 问题多半已被工具根治，规则只是在占用注意力
+  拦不住的   软规则高频被违反 —— 说明文字管不住它，该升级成硬校验器，
+             然后**把原来那条软规则删掉**（不是留着两份）
+  超重的     宪法超 4 KB / 热区超预算 —— 必须先删再加
+
+没有命中数据，减法就只能靠拍脑袋，而拍脑袋的结果永远是「先留着吧」。
+
+用法:
+  ratchet-audit [--root DIR] [--stale-days N]
+"""
+import argparse
+import collections
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+STALE_DAYS = 180  # 半年零命中 = 淘汰候选
+
+
+def load_hits(root: str) -> list[dict]:
+    p = os.path.join(root, ".ratchet", "hits.jsonl")
+    out = []
+    try:
+        with open(p, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def known_rules() -> dict:
+    try:
+        r = subprocess.run([os.path.join(HERE, "ratchet-guard"), "--list-rules"],
+                           capture_output=True, text=True, timeout=5)
+        return json.loads(r.stdout)
+    except Exception:
+        return {"deny": [], "ask": []}
+
+
+def days_since(iso: str) -> int:
+    try:
+        t = datetime.datetime.fromisoformat(iso)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (now - t).days
+    except Exception:
+        return 9999
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--root", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    ap.add_argument("--stale-days", type=int, default=STALE_DAYS)
+    a = ap.parse_args()
+    root = a.root
+
+    if not os.path.isdir(os.path.join(root, ".ratchet")):
+        print("未初始化（没有 .ratchet/）。先跑 /ratchet:init", file=sys.stderr)
+        return 1
+
+    hits = load_hits(root)
+    rules = known_rules()
+    all_ids = rules.get("deny", []) + rules.get("ask", [])
+
+    cnt = collections.Counter(h.get("rule") for h in hits)
+    last = {}
+    for h in hits:
+        r = h.get("rule")
+        if r and (r not in last or h.get("at", "") > last[r]):
+            last[r] = h.get("at", "")
+
+    print("减法审计")
+    print("=" * 60)
+
+    # ── 硬校验器：命中统计 ──────────────────────────────────
+    print(f"\n■ 硬校验器（{len(all_ids)} 条）\n")
+    fossils, active = [], []
+    for rid in all_ids:
+        n = cnt.get(rid, 0)
+        if n == 0:
+            fossils.append(rid)
+        else:
+            active.append((rid, n, days_since(last.get(rid, ""))))
+
+    if active:
+        print("  有效（拦到过东西）")
+        for rid, n, d in sorted(active, key=lambda x: -x[1]):
+            print(f"    {n:>4} 次   {rid:<18} 最近 {d} 天前")
+    if fossils:
+        print(f"\n  零命中（{len(fossils)} 条）")
+        print(f"    {', '.join(fossils)}")
+        print("    → 硬校验器零命中**不必删**：它们是纯代码，不占上下文，")
+        print("      留着是廉价保险。真正要减的是下面那些占注意力的软规则。")
+
+    # ── 软规则：占上下文的那些 ─────────────────────────────
+    rdir = os.path.join(root, ".ratchet", "rules")
+    soft = []
+    if os.path.isdir(rdir):
+        for f in sorted(os.listdir(rdir)):
+            p = os.path.join(rdir, f)
+            if os.path.isfile(p):
+                age = (datetime.datetime.now().timestamp() - os.path.getmtime(p)) / 86400
+                soft.append((f, os.path.getsize(p), int(age)))
+
+    print(f"\n■ 软规则（{len(soft)} 条 · 每条都在吃上下文）\n")
+    if not soft:
+        print("  （无）—— 很好。软规则是最后手段，能写成校验器就别写成规则。")
+    else:
+        for f, sz, age in soft:
+            flag = "  ← 半年没动过，还需要吗？" if age > a.stale_days else ""
+            print(f"    {sz:>5} B   {f:<28} {age} 天未改{flag}")
+
+    # ── 宪法与热区 ─────────────────────────────────────────
+    print("\n■ 体积")
+    cons = os.path.join(root, ".ratchet", "constitution.md")
+    if os.path.isfile(cons):
+        n = os.path.getsize(cons)
+        s = "🟢" if n <= 4096 else "🔴 超 4 KB —— 加新规则前必须先删一条"
+        print(f"    宪法 {n} B / 4096 B  {s}")
+
+    print()
+    sys.stdout.flush()  # 子进程直接写 fd，不 flush 会让本进程的缓冲输出排到它后面
+    subprocess.run([os.path.join(HERE, "ratchet-overhead"), "--root", root])
+    sys.stdout.flush()
+
+    # ── 结论 ───────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("减法优先级：")
+    print("  1. 软规则 > 硬校验器 —— 软规则吃上下文，校验器不吃。能转就转")
+    print("  2. 高频命中的软规则 = 文字管不住它 → 写成校验器，然后**删掉原规则**")
+    print("  3. 长期没再犯的规则 = 化石 → 删。真犯了，棘轮会再把它加回来")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

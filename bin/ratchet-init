@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""
+ratchet-init — 把脚手架铺到一个项目里。
+
+铺文件是确定性工作，所以交给脚本，不交给模型 —— 模型每次「记得铺哪些文件」
+是不可靠的，而且不可测。skill 只负责交互（问档位）和解释，落盘由这里做。
+
+数据解耦：
+  .ratchet/constitution.md  是 plugin 的产物，upgrade 时可覆写（会先 diff）
+  .ratchet/state.json       是你的数据，**永不覆写**
+  .ratchet/log/             是你的数据，**永不覆写**
+这条线必须在 init 时就用目录划清，否则某次 upgrade 会把你的留痕抹掉。
+
+AGENTS.md 是纪律的唯一真源，CLAUDE.md 用 @ 导入它 ——
+因为 Codex 不支持 @import 语法（实测确认），只能让它读一份完整的 AGENTS.md。
+
+用法:
+  ratchet-init --preset standard|complex [--context-window N] [--root DIR] [--force]
+  ratchet-init --check          # 只报告现状，不写任何东西
+"""
+import argparse
+import datetime
+import json
+import os
+import shutil
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES = os.path.join(HERE, "..", "templates")
+
+CLAUDE_MD = """# 项目说明
+
+<!-- 纪律基线由 ratchet 维护，唯一真源是 AGENTS.md。
+     Codex 不支持 @import，所以完整内容放在 AGENTS.md 里，这边导入。 -->
+@AGENTS.md
+
+## 本项目特有
+
+<!-- 只写这个项目独有的东西：领域术语、技术栈约定、专属红线。
+     通用的工程纪律不要写在这里 —— 那是 AGENTS.md 的职责，重复会导致两边打架。 -->
+"""
+
+AGENTS_HEAD = """<!-- 本段由 ratchet 维护。纪律基线的唯一真源。
+     Claude Code 通过 CLAUDE.md 的 @AGENTS.md 导入本文件；Codex 直接读本文件。 -->
+
+"""
+
+
+def die(msg: str) -> int:
+    print(f"ratchet-init: {msg}", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--preset", choices=["standard", "complex"])
+    ap.add_argument("--context-window", type=int)
+    ap.add_argument("--root", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    a = ap.parse_args()
+
+    root = os.path.abspath(a.root)
+    rd = os.path.join(root, ".ratchet")
+    state_p = os.path.join(rd, "state.json")
+
+    if a.check:
+        print(f"项目: {root}")
+        print(f".ratchet/     {'已存在' if os.path.isdir(rd) else '未初始化'}")
+        if os.path.isfile(state_p):
+            try:
+                st = json.load(open(state_p, encoding="utf-8"))
+                print(f"档位:         {st.get('preset')}")
+                print(f"会话数:       {(st.get('session') or {}).get('last', 0)}")
+            except Exception as e:
+                print(f"state.json 损坏: {e}")
+        return 0
+
+    if not a.preset:
+        return die("必须指定 --preset standard|complex")
+
+    if os.path.isfile(state_p) and not a.force:
+        return die(
+            f"{state_p} 已存在。init 不会覆盖你的状态数据。\n"
+            f"  想重置状态：手工删除 .ratchet/state.json 后重跑\n"
+            f"  只想更新宪法/模板：用 --force（只覆写 plugin 产物，不动 state 与 log）"
+        )
+
+    # ── 目录 ────────────────────────────────────────────────
+    os.makedirs(os.path.join(rd, "rules"), exist_ok=True)
+    os.makedirs(os.path.join(rd, "log"), exist_ok=True)
+    os.makedirs(os.path.join(rd, "archive"), exist_ok=True)
+
+    # ── plugin 产物：可覆写 ─────────────────────────────────
+    src = os.path.join(TEMPLATES, "constitution.md")
+    dst = os.path.join(rd, "constitution.md")
+    if os.path.isfile(src):
+        shutil.copyfile(src, dst)
+        n = os.path.getsize(dst)
+        if n > 4096:
+            print(f"⚠️  constitution.md {n} B 超过 4 KB 硬上限 —— 模板本身该瘦身了", file=sys.stderr)
+
+    # ── config：静态配置 ────────────────────────────────────
+    cfg_p = os.path.join(rd, "config.json")
+    cfg = {}
+    if os.path.isfile(cfg_p):
+        try:
+            cfg = json.load(open(cfg_p, encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    cfg["preset"] = a.preset
+    if a.context_window:
+        cfg["context_window"] = a.context_window
+    cfg.setdefault("context_window", 200_000)
+    json.dump(cfg, open(cfg_p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+    # ── state：你的数据，只在不存在时创建 ───────────────────
+    if not os.path.isfile(state_p):
+        json.dump({
+            "schema_version": 1,
+            "preset": a.preset,
+            "current": {"task": "（尚未开始）", "next": "（尚未确定）",
+                        "iteration": None, "stage": None},
+            "blocked": [],
+            "pending_user": [],
+            "recent_decisions": [],
+            "session": {"last": 0, "last_date": datetime.date.today().isoformat(),
+                        "log_written": True},
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        }, open(state_p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+    # ── AGENTS.md：纪律的唯一真源 ───────────────────────────
+    agents_p = os.path.join(root, "AGENTS.md")
+    constitution = open(dst, encoding="utf-8").read() if os.path.isfile(dst) else ""
+    if os.path.isfile(agents_p) and not a.force:
+        print(f"ℹ️  AGENTS.md 已存在，未改动。纪律基线在 .ratchet/constitution.md，"
+              f"请自行决定是否引用。")
+    else:
+        open(agents_p, "w", encoding="utf-8").write(AGENTS_HEAD + constitution)
+
+    # ── CLAUDE.md：薄壳，@ 导入 AGENTS.md ───────────────────
+    claude_p = os.path.join(root, "CLAUDE.md")
+    if not os.path.isfile(claude_p):
+        open(claude_p, "w", encoding="utf-8").write(CLAUDE_MD)
+    elif "@AGENTS.md" not in open(claude_p, encoding="utf-8").read():
+        print("ℹ️  CLAUDE.md 已存在但未导入 AGENTS.md。建议在开头加一行： @AGENTS.md")
+
+    print(f"✅ ratchet 已初始化（档位: {a.preset}）\n")
+    print(f"  .ratchet/state.json      你的状态（唯一真源，永不被覆写）")
+    print(f"  .ratchet/constitution.md 纪律基线（plugin 产物，upgrade 会更新）")
+    print(f"  .ratchet/log/            会话留痕（自动生成）")
+    print(f"  .ratchet/rules/          你的自定义规则（/ratchet 会往这里加）")
+    print(f"  AGENTS.md                纪律真源（Codex 直接读）")
+    print(f"  CLAUDE.md                薄壳，@ 导入 AGENTS.md")
+    print(f"\n下一步：把 .ratchet/state.json 的 current.task / current.next 填上，"
+          f"起手简报就会显示它们。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

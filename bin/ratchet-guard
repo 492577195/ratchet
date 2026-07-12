@@ -25,40 +25,57 @@ AI 一句 `npm install` 就中招，post-install 脚本在毫秒级窃取云凭�
   放行时输出 {} 并 exit 0。**决策一律走 JSON body，不用退出码** —— 退出码非 0
   会被平台当成 hook 自身故障，而不是「拒绝」。
 """
+import datetime
 import json
 import os
 import re
 import sys
 
+# 每条规则带 id —— 命中会被记录，供 /ratchet:slim 做减法审计。
+# 长期零命中的规则是化石（问题多半已被工具根治），该淘汰；
+# 高频命中说明它是真问题，值得留着。没有命中数据，减法就只能靠拍脑袋。
+
 # ── deny：不可逆的破坏 ───────────────────────────────────────────────
 DENY = [
-    (re.compile(r"\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR][a-zA-Z]*f|\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*f[a-zA-Z]*[rR]"),
+    ("rm-rf",
+     re.compile(r"\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR][a-zA-Z]*f|\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*f[a-zA-Z]*[rR]"),
      "递归强制删除（rm -rf）。要删就明确列出路径，或让用户自己执行。"),
-    (re.compile(r"\bgit\s+push\b.*(--force\b(?!-with-lease)|(?<![\w-])-f(?![\w-]))"),
+    ("push-force",
+     re.compile(r"\bgit\s+push\b.*(--force\b(?!-with-lease)|(?<![\w-])-f(?![\w-]))"),
      "git push --force 会覆写远端历史，不可逆。改用 --force-with-lease，或请用户确认。"),
-    (re.compile(r"\bgit\s+reset\s+--hard\b"),
+    ("reset-hard",
+     re.compile(r"\bgit\s+reset\s+--hard\b"),
      "git reset --hard 会丢弃工作区改动，不可逆。先 stash 或 commit。"),
-    (re.compile(r"\bgit\s+checkout\s+--\s"),
+    ("checkout-discard",
+     re.compile(r"\bgit\s+checkout\s+--\s"),
      "git checkout -- <path> 会丢弃该文件的所有未提交改动，不可逆。"),
-    (re.compile(r"\bgit\s+clean\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*f"),
+    ("git-clean",
+     re.compile(r"\bgit\s+clean\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*f"),
      "git clean -f 会删除未跟踪文件，不可逆。先 git clean -n 看看会删什么。"),
-    (re.compile(r">\s*/dev/(sd|disk|nvme)"),
+    ("block-device",
+     re.compile(r">\s*/dev/(sd|disk|nvme)"),
      "直接写块设备。"),
-    (re.compile(r"\bmkfs\b|\bdd\s+.*\bof=/dev/"),
+    ("mkfs-dd",
+     re.compile(r"\bmkfs\b|\bdd\s+.*\bof=/dev/"),
      "格式化 / 裸写磁盘。"),
 ]
 
 # ── ask：可能危险，转人工 ────────────────────────────────────────────
 ASK = [
-    (re.compile(r"\bgit\s+push\b(?!.*--dry-run)"),
+    ("push",
+     re.compile(r"\bgit\s+push\b(?!.*--dry-run)"),
      "push 是对外动作，请确认目标分支与远端。"),
-    (re.compile(r"\bgit\s+rebase\b|\bgit\s+filter-branch\b|\bgit\s+reflog\s+expire\b"),
+    ("rewrite-history",
+     re.compile(r"\bgit\s+rebase\b|\bgit\s+filter-branch\b|\bgit\s+reflog\s+expire\b"),
      "改写历史。"),
-    (re.compile(r"\bchmod\s+(-[a-zA-Z]+\s+)*777\b"),
+    ("chmod-777",
+     re.compile(r"\bchmod\s+(-[a-zA-Z]+\s+)*777\b"),
      "chmod 777 放开全部权限。"),
-    (re.compile(r"\bcurl\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b|\bwget\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b"),
+    ("curl-pipe-sh",
+     re.compile(r"\bcurl\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b|\bwget\b[^|]*\|\s*(sudo\s+)?(ba)?sh\b"),
      "把网络内容直接管进 shell 执行 —— 无法审计执行了什么。先下载、看一眼、再跑。"),
-    (re.compile(r"\bsudo\b"),
+    ("sudo",
+     re.compile(r"\bsudo\b"),
      "提权操作。"),
 ]
 
@@ -129,23 +146,53 @@ def extract_command(payload: dict) -> str:
     return ""
 
 
-def emit(decision: str | None, reason: str = "") -> int:
+def record_hit(root: str, rule_id: str, decision: str) -> None:
+    """记一笔命中。这是棘爪释放的数据基础 —— 没有命中统计，减法就只能靠拍脑袋。
+
+    失败绝不能影响拦截本身：审计是次要的，门禁是主要的。
+    """
+    try:
+        rd = os.path.join(root, ".ratchet")
+        if not os.path.isdir(rd):
+            return
+        line = json.dumps(
+            {"rule": rule_id, "decision": decision,
+             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")},
+            ensure_ascii=False,
+        )
+        with open(os.path.join(rd, "hits.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def emit(decision: str | None, reason: str = "", rule_id: str = "", root: str = "") -> int:
     if decision is None:
         print("{}")
-    else:
-        json.dump(
-            {"hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": decision,
-                "permissionDecisionReason": f"[ratchet-guard] {reason}",
-            }},
-            sys.stdout, ensure_ascii=False,
-        )
-        print()
+        return 0
+    if rule_id and root:
+        record_hit(root, rule_id, decision)
+    json.dump(
+        {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": f"[ratchet-guard] {reason}",
+        }},
+        sys.stdout, ensure_ascii=False,
+    )
+    print()
     return 0  # 决策走 JSON body，退出码恒 0（非 0 会被当成 hook 故障）
 
 
 def main() -> int:
+    if "--list-rules" in sys.argv:
+        json.dump(
+            {"deny": [r[0] for r in DENY], "ask": [r[0] for r in ASK] + ["slopsquatting"]},
+            sys.stdout, ensure_ascii=False,
+        )
+        print()
+        return 0
+
     try:
         payload = json.load(sys.stdin)
     except Exception:
@@ -157,17 +204,17 @@ def main() -> int:
 
     root = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 
-    for pat, why in DENY:
+    for rid, pat, why in DENY:
         if pat.search(cmd):
-            return emit("deny", why)
+            return emit("deny", why, rid, root)
 
     slop = check_install(cmd, root)
     if slop:
-        return emit("ask", slop)
+        return emit("ask", slop, "slopsquatting", root)
 
-    for pat, why in ASK:
+    for rid, pat, why in ASK:
         if pat.search(cmd):
-            return emit("ask", why)
+            return emit("ask", why, rid, root)
 
     return emit(None)
 

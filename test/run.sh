@@ -200,6 +200,55 @@ rm -rf "$PROJ"
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "SKILLS · 双平台 frontmatter + init 幂等 + 减法审计"
+# ─────────────────────────────────────────────────────────────
+# Codex 的 SKILL.md 只认 name + description（实测确认）。多一个字段就可能
+# 让 skill 在 Codex 侧加载失败 —— 而失败是静默的。
+badfm=$(for f in skills/*/SKILL.md; do
+  python3 -c "
+import sys,re
+t=open('$f',encoding='utf-8').read()
+m=re.match(r'^---\n(.*?)\n---\n', t, re.S)
+if not m: print('$f'); raise SystemExit
+ks={l.split(':')[0].strip() for l in m.group(1).splitlines() if l.strip() and not l.startswith(' ')}
+if not ks <= {'name','description'}: print('$f')"
+done)
+[ -z "$badfm" ] && ok "所有 SKILL.md frontmatter 仅 name/description（Codex 兼容）" \
+  || bad "以下 skill 含 Codex 不认的字段" "$badfm"
+
+# 宪法 4 KB 硬上限 —— 一份没人读完的宪法等于没有宪法
+cn=$(wc -c < templates/constitution.md | tr -d ' ')
+[ "$cn" -le 4096 ] && ok "宪法 ${cn} B ≤ 4096 B（原工程 CLAUDE.md 是 13,183 B）" \
+  || bad "宪法 ${cn} B 超 4 KB —— 加新规则前必须先删一条"
+
+# init：铺得对、state 合法、简报在预算内
+PJ=$(mktemp -d)
+$BIN/ratchet-init --preset standard --context-window 1000000 --root "$PJ" >/dev/null 2>&1
+for f in .ratchet/state.json .ratchet/config.json .ratchet/constitution.md AGENTS.md CLAUDE.md; do
+  [ -e "$PJ/$f" ] || bad "init 未铺出 $f"
+done
+ok "init 铺出完整骨架"
+$BIN/ratchet-state --state "$PJ/.ratchet/state.json" >/dev/null 2>&1 && ok "init 产出的 state 合法" || bad "init 产出的 state 非法"
+grep -q "@AGENTS.md" "$PJ/CLAUDE.md" && ok "CLAUDE.md 通过 @ 导入 AGENTS.md（Codex 不支持 @import，故真源在 AGENTS.md）" \
+  || bad "CLAUDE.md 未导入 AGENTS.md"
+
+# 数据解耦铁律：init 绝不能覆盖用户的 state 与 log
+python3 -c "
+import json;p='$PJ/.ratchet/state.json';d=json.load(open(p))
+d['current']['task']='用户的重要数据';json.dump(d,open(p,'w'),ensure_ascii=False)"
+$BIN/ratchet-init --preset complex --root "$PJ" >/dev/null 2>&1
+keep=$(python3 -c "import json;print(json.load(open('$PJ/.ratchet/state.json'))['current']['task'])")
+[ "$keep" = "用户的重要数据" ] && ok "重跑 init 不覆盖用户 state（数据解耦铁律）" \
+  || bad "init 覆盖了用户数据 —— 这会抹掉留痕"
+
+# guard 命中记录 → 减法审计的数据基础
+printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /x"},"cwd":"%s"}' "$PJ" | $BIN/ratchet-guard >/dev/null
+[ -f "$PJ/.ratchet/hits.jsonl" ] && ok "guard 命中写入 hits.jsonl（棘爪释放的数据基础）" || bad "未记录命中"
+$BIN/ratchet-audit --root "$PJ" >/dev/null 2>&1 && ok "ratchet-audit 可运行" || bad "ratchet-audit 失败"
+rm -rf "$PJ"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "ROBUSTNESS · 坏输入绝不能让 hook 崩掉"
 # ─────────────────────────────────────────────────────────────
 printf 'not json\n{"type":"assistant"}\n' > "$TMP/bad.jsonl"
