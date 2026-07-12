@@ -51,23 +51,27 @@ AI 协作工程脚手架。跨 Claude Code 与 OpenAI Codex。
 
 ## 装
 
+本仓是**私有仓**，所以必须用 SSH URL —— `492577195/ratchet` 这种简写会走匿名 HTTPS，被 GitHub 拒绝。（若日后改为公开仓，简写才能用。）
+
 **Claude Code**
 
 ```
-/plugin marketplace add 492577195/ratchet
+/plugin marketplace add git@github.com:492577195/ratchet.git
 /plugin install ratchet@ratchet
 ```
 
 **Codex**
 
 ```bash
-codex plugin marketplace add 492577195/ratchet
+codex plugin marketplace add git@github.com:492577195/ratchet.git
 codex plugin add ratchet@ratchet
 ```
 
-（也可以指向本地路径开发：把 `492577195/ratchet` 换成仓库的绝对路径。）
+本地开发时把 URL 换成仓库绝对路径即可。
 
-装完在项目里跑 `/ratchet:init`，选档位（普通 / 复杂），铺出 `.ratchet/`。
+装完在项目里跑 `/ratchet:init`。**注意 Codex 没有自定义 slash 命令**，靠 skill 的 description 自然语言触发 —— 直接说「初始化这个项目的工程脚手架」。
+
+选档位（普通 / 复杂），铺出 `.ratchet/`。
 
 **简单项目不要装** —— 这是最有效的防臃肿措施。
 
