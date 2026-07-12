@@ -54,16 +54,18 @@ AI 协作工程脚手架。跨 Claude Code 与 OpenAI Codex。
 **Claude Code**
 
 ```
-/plugin marketplace add /Users/dacong/Task/ratchet
+/plugin marketplace add 492577195/ratchet
 /plugin install ratchet@ratchet
 ```
 
 **Codex**
 
 ```bash
-codex plugin marketplace add /Users/dacong/Task/ratchet
+codex plugin marketplace add 492577195/ratchet
 codex plugin add ratchet@ratchet
 ```
+
+（也可以指向本地路径开发：把 `492577195/ratchet` 换成仓库的绝对路径。）
 
 装完在项目里跑 `/ratchet:init`，选档位（普通 / 复杂），铺出 `.ratchet/`。
 

@@ -11,7 +11,10 @@
   "plugins": [
     {
       "name": "ratchet",
-      "source": "./",
+      "source": {
+        "source": "github",
+        "repo": "492577195/ratchet"
+      },
       "description": "把可机器化的工程纪律下沉为确定性门禁，并保证机制的上下文成本与项目年龄无关。",
       "category": "productivity",
       "tags": [

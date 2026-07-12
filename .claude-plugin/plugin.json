@@ -15,5 +15,7 @@
     "context-management",
     "cross-platform"
   ],
-  "hooks": "./hooks/hooks.json"
+  "hooks": "./hooks/hooks.json",
+  "homepage": "https://github.com/492577195/ratchet",
+  "repository": "https://github.com/492577195/ratchet"
 }
