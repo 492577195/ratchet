@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""
+ratchet-digest — 从 transcript 自动生成 session 日志的「机械部分」。
+
+这是 K2 的实现。原工程要求模型在每次会话结束时手写 8 段日志（改了什么、
+跑了什么命令、工时、成本、上下文……），230 个会话写了 1.86 MB。其中绝大多数
+内容是机械事实 —— 模型是在用推理算力誊写 transcript 里已经有的东西。
+
+机械事实交给机器：工具调用、改动文件、执行的命令、token 消耗，全部自动抽取。
+模型只写机器写不出来的那一段 —— 决策与教训 —— 硬上限 1 KB。
+
+用法:
+  ratchet-digest --transcript <path> [--session N]
+  echo '<hook payload>' | ratchet-digest        # 从 hook stdin 读
+
+输出: markdown，写入 track/<日期>/session-N.md 的前半部分。
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import transcript  # noqa: E402
+
+# 噪声：查看类命令，日志不需要（日志要的是「做了什么」，不是终端回放）
+_NOISE = re.compile(r"^(ls|cat|head|tail|pwd|echo|wc|find|grep|which|printf|chmod|cd)\b|^git (status|log|diff|show)\b")
+# 脚手架：变量赋值、set 选项、控制流、heredoc 内容 —— 都不是「命令」
+_SCAFFOLD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=|^set\s+[-+]|^(if|then|else|fi|for|do|done|while|EOF|PY|\}|\{)\b|^#")
+MAX_CMDS = 8
+MAX_FILES = 12
+
+
+def signal_commands(cmds: list[str]) -> list[str]:
+    """抽出有信号的命令。
+
+    首版的 bug：直接取多行脚本的第一行，结果抽出来全是 `TDIR=...` `set -u` 这类
+    变量赋值。真正的命令往往在脚本中间。改为逐行扫描、剔除脚手架行，取第一条实质命令。
+    """
+    out = []
+    for block in cmds:
+        picked = None
+        for ln in block.splitlines():
+            ln = ln.strip()
+            if not ln or _SCAFFOLD.match(ln) or _NOISE.match(ln):
+                continue
+            picked = ln
+            break
+        if not picked:
+            continue
+        if len(picked) > 100:
+            picked = picked[:97] + "..."
+        if picked not in out:
+            out.append(picked)
+    return out[:MAX_CMDS]
+
+
+def rel(p: str, root: str) -> str:
+    try:
+        return os.path.relpath(p, root)
+    except ValueError:
+        return p
+
+
+def render(d: transcript.Digest, session: int | None, root: str) -> str:
+    today = datetime.date.today().isoformat()
+    sid = f"s-{session}" if session is not None else "s-?"
+    L = [f"# {sid} · {today}", ""]
+
+    L.append("## 做了什么（自动抽取，勿手改）")
+    L.append("")
+    if d.files_written:
+        L.append("**改动文件**")
+        for f in d.files_written[:MAX_FILES]:
+            L.append(f"- `{rel(f, root)}`")
+        if len(d.files_written) > MAX_FILES:
+            L.append(f"- …另有 {len(d.files_written) - MAX_FILES} 个")
+        L.append("")
+
+    cmds = signal_commands(d.commands)
+    if cmds:
+        L.append("**关键命令**")
+        L.append("")
+        L.append("```bash")
+        L.extend(cmds)
+        L.append("```")
+        L.append("")
+
+    tools = " · ".join(f"{k}×{v}" for k, v in d.tools.most_common(8))
+    L.append(f"**工具**：{tools or '（无）'}")
+    L.append(f"**轮次**：{d.turns}")
+    L.append(
+        f"**token**：in {d.input_tokens:,} · out {d.output_tokens:,} · "
+        f"cache 读 {d.cache_read:,} / 写 {d.cache_write:,} · 合计 {d.total_tokens:,}"
+    )
+    if d.context_window:
+        L.append(f"**上下文**：{d.context_pct}% ({d.context_used:,}/{d.context_window:,})")
+    L.append("")
+    L.append("---")
+    L.append("")
+    L.append("## 决策与教训（本节由你手写，≤ 1 KB）")
+    L.append("")
+    L.append("> 只写机器写不出来的东西：为什么这么选、哪里判断错了、下次别再踩什么。")
+    L.append("> 不要复述上面已有的机械事实。写不满不用凑。")
+    L.append("")
+    L.append("- ")
+    L.append("")
+    return "\n".join(L)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--transcript")
+    ap.add_argument("--session", type=int)
+    ap.add_argument("--root", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    a = ap.parse_args()
+
+    path = a.transcript
+    if not path and not sys.stdin.isatty():
+        try:
+            path = json.load(sys.stdin).get("transcript_path", "")
+        except Exception:
+            path = ""
+    if not path:
+        print("ratchet-digest: 需要 --transcript 或 hook stdin payload", file=sys.stderr)
+        return 1
+
+    d = transcript.parse(path)
+    sys.stdout.write(render(d, a.session, a.root))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

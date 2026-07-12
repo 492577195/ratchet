@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""
+ratchet-context — 上下文占用率，喂 statusLine。
+
+治的是这个病：原工程把「上下文卫生」写成一条纪律，要求模型每次任务完成时
+自行估算占比并汇报。结果是模型经常忘（用户在 s-98 明确抱怨过）。
+估算这种事本来就不该由模型做 —— 它是确定性计算，交给状态栏常显即可。
+
+用法（statusLine）:
+  在 settings.json 里配 {"statusLine": {"type": "command", "command": ".../ratchet-context"}}
+  stdin 收到 statusLine payload（含 transcript_path），stdout 输出一行。
+
+用法（CLI）:
+  ratchet-context --transcript <path>
+
+退出码永远 0：状态栏坏掉不该影响会话。
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+import transcript  # noqa: E402
+
+# 纪律「上下文卫生」的四档
+BANDS = [(50, "🟢"), (70, "🟡"), (85, "🟠"), (101, "🔴")]
+
+
+def band(pct: float) -> str:
+    for limit, emoji in BANDS:
+        if pct < limit:
+            return emoji
+    return "🔴"
+
+
+def main() -> int:
+    path, window = "", None
+    if "--transcript" in sys.argv:
+        path = sys.argv[sys.argv.index("--transcript") + 1]
+    else:
+        try:
+            payload = json.load(sys.stdin)
+            path = payload.get("transcript_path", "")
+        except Exception:
+            pass
+    if "--window" in sys.argv:
+        window = int(sys.argv[sys.argv.index("--window") + 1])
+
+    try:
+        # 窗口大小是环境属性，transcript 里没有 —— 优先读 .ratchet/config.json
+        if window is None:
+            window = transcript.load_config().get("context_window")
+        d = transcript.parse(path, window)
+    except Exception:
+        return 0  # 状态栏永不阻塞会话
+
+    if not d.context_window or not d.context_used:
+        return 0
+
+    pct = d.context_pct
+    used_k = d.context_used / 1000
+    win_k = d.context_window / 1000
+    print(f"{band(pct)} ctx {pct:.0f}% ({used_k:.0f}k/{win_k:.0f}k)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
