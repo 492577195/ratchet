@@ -93,17 +93,22 @@ def validate(node, schema, path="", errs=None) -> list[str]:
 
 
 def emit_hook(errs: list[str]) -> int:
-    """PostToolUse 模式：把校验结果回灌给模型，让它当场改，而不是留到后面爆炸。"""
+    """PostToolUse 模式：把校验结果回灌给模型，让它当场改，而不是留到后面爆炸。
+
+    协议：PostToolUse 用**顶层** decision/reason，不是 hookSpecificOutput.permissionDecision
+    —— 后者是 PreToolUse 专用字段。见 https://code.claude.com/docs/en/hooks
+
+    首版凭 PreToolUse 的印象套了 permissionDecision，平台不认识该字段、静默丢弃，
+    这道门禁于是**从未拒绝过任何东西**：schema 里的 maxLength/maxItems 一直没有约束力。
+    47 条测试全绿也没抓到，因为测试只断言了「校验器判得对不对」，没断言「判完有没有人听得见」。
+    下方 test/run.sh 的 STATE·HOOK 协议段负责堵住这个洞。
+    """
     if not errs:
         print("{}")
         return 0
     reason = "state.json 不符合 schema：\n" + "\n".join(f"- {e}" for e in errs)
     json.dump(
-        {"hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "permissionDecision": "ask",
-            "permissionDecisionReason": f"[ratchet-state] {reason}",
-        }},
+        {"decision": "block", "reason": f"[ratchet-state] {reason}"},
         sys.stdout, ensure_ascii=False,
     )
     print()

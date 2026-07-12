@@ -269,6 +269,43 @@ rm -rf "$PJ"
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "STATE·HOOK · 输出协议（判得对，还得让平台听得见）"
+# ─────────────────────────────────────────────────────────────
+# 溯源：首版 emit_hook 凭 PreToolUse 的印象，给 PostToolUse 发了
+# hookSpecificOutput.permissionDecision —— 那是 PreToolUse 专用字段。平台不认识、
+# 静默丢弃，于是这道门禁**从未拒绝过任何东西**，schema 的 maxLength/maxItems 全是摆设。
+# 当时 47 条测试全绿：它们只断言了校验器判得对不对，没断言判完有没有人听得见。
+# 协议依据：https://code.claude.com/docs/en/hooks
+#   PreToolUse  → hookSpecificOutput.permissionDecision (allow/deny/ask)
+#   PostToolUse → 顶层 decision: "block" + reason
+# --hook 走的是真实 hook 通路：payload 从 stdin 进，file_path 必须落在 .ratchet/state.json。
+# 测试必须走这条通路，不能拿 --state 抄近路 —— 否则测的就不是平台实际会跑的那段代码。
+HKD="$TMP/hk/.ratchet"; mkdir -p "$HKD"; HK="$HKD/state.json"
+python3 -c "
+import json
+d = json.load(open('.ratchet/state.json'))
+d['current']['task'] = '超' * 60          # 60 字 > maxLength 50
+json.dump(d, open('$HK', 'w'), ensure_ascii=False)"
+hookpay() { printf '{"tool_name":"Edit","tool_input":{"file_path":"%s"},"cwd":"%s"}' "$1" "$TMP/hk"; }
+hookout=$(hookpay "$HK" | $BIN/ratchet-state --hook 2>/dev/null); hookrc=$?
+
+echo "$hookout" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("decision")=="block" and d.get("reason") else 1)' \
+  && ok "非法 state → 顶层 decision:block + reason（PostToolUse 协议）" \
+  || bad "非法 state 未按 PostToolUse 协议阻断" "$hookout"
+
+echo "$hookout" | grep -q "permissionDecision" \
+  && bad "PostToolUse 误用了 permissionDecision —— 那是 PreToolUse 专用字段，平台会静默丢弃" \
+  || ok "未误用 permissionDecision（PreToolUse 专用字段）"
+
+[ "$hookrc" -eq 0 ] && ok "阻断时退出码仍为 0（决策走 JSON，非退出码）" \
+  || bad "阻断时退出码非 0 —— 会被平台误判为 hook 自身故障"
+
+hookpay "$PWD/.ratchet/state.json" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decision" \
+  && bad "合法 state 竟然也阻断 —— 误伤会让用户直接关掉门禁" \
+  || ok "合法 state 静默放行"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "ROBUSTNESS · 坏输入绝不能让 hook 崩掉"
 # ─────────────────────────────────────────────────────────────
 printf 'not json\n{"type":"assistant"}\n' > "$TMP/bad.jsonl"
