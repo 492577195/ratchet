@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "preset": "complex",
+  "current": {
+    "task": "P5 dogfood：用 ratchet 管理 ratchet 自己",
+    "next": "装 CC plugin，在 dev 上跑完整迭代验证闭环",
+    "iteration": "v0.1.0",
+    "stage": "testing"
+  },
+  "blocked": [
+    {
+      "what": "Codex PreToolUse deny 未证实",
+      "unblock": "Codex 额度恢复后用隔离环境补测",
+      "since": "2026-07-12"
+    }
+  ],
+  "pending_user": [],
+  "recent_decisions": [
+    {
+      "decision": "hooks.json 两平台共用一份",
+      "why": "顶层字段是唯一障碍",
+      "date": "2026-07-12"
+    },
+    {
+      "decision": "真门禁放本地 pre-push",
+      "why": "Free 私有仓无 Rulesets",
+      "date": "2026-07-12"
+    },
+    {
+      "decision": "state.json 作状态唯一真源",
+      "why": "散文状态致校验器脆弱",
+      "date": "2026-07-12"
+    }
+  ],
+  "session": {
+    "last": 1,
+    "last_date": "2026-07-12",
+    "log_written": true
+  },
+  "updated_at": "2026-07-12T11:16:10+00:00"
+}
