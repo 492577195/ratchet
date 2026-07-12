@@ -228,6 +228,50 @@ ro_expect allow Read "$(ro_json file_path "$RO/cases/truth.py")"       "Read 工
 ro_expect allow Write "$(ro_json file_path "$RP/src/app.py" content x)" \
   "工作区内正常写入不受影响"
 
+# ── 自封：AI 不许自己把只读区关掉 ─────────────────────────────
+# 首版漏了这条 —— 只读区保护了判据，却没保护自己。AI 只要删掉 config.json 里的
+# readonly_paths，约束就没了，然后回头随便改判据。实测四种姿势全部得手。
+# 一个 AI 能自行解除的约束，等于没有约束。
+# （用户仍然改得动：手动编辑文件不经过 hook。挡的是 AI 的工具调用。）
+ro_expect deny Write "$(ro_json file_path "$RP/.ratchet/config.json" content '{}')" \
+  "Write 覆盖 config（抹掉 readonly_paths）"
+ro_expect deny Edit "$(ro_json file_path "$RP/.ratchet/config.json" old_string readonly_paths new_string _disabled)" \
+  "Edit 改 config 键名停用只读区"
+ro_expect deny Bash "$(ro_cmd "echo x > $RP/.ratchet/config.json")" "重定向覆盖 config"
+ro_expect deny Bash "$(ro_cmd "rm $RP/.ratchet/config.json")"       "删掉 config"
+
+# ── 装好的 guard 不许被 AI 覆盖掉 ─────────────────────────────
+# 只锁 config 还不够：AI 可以绕开配置，直接把 plugin cache 里的 ratchet-guard
+# 覆盖成一个永远放行的空壳 —— 下次会话所有约束一起消失。成本极低，收益最大，
+# 是自循环里的 AI 最可能走的一条路。
+# 只锁「已安装」的那份（跑自 ~/.claude/plugins/）；--plugin-dir 指向工作树的
+# 开发模式不锁，否则没法开发 ratchet 自己。
+FAKE="$TMP/home/.claude/plugins/cache/ratchet/9.9.9"
+mkdir -p "$FAKE/bin"
+cp "$BIN/ratchet-guard" "$FAKE/bin/ratchet-guard"
+got=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s/bin/ratchet-guard","content":"# neutered"},"cwd":"%s"}' "$FAKE" "$RP" \
+  | "$FAKE/bin/ratchet-guard" 2>/dev/null \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin).get("hookSpecificOutput")
+print(d["permissionDecision"] if d else "allow")')
+[ "$got" = "deny" ] && ok "deny  ← AI 覆盖已安装的 guard（把门禁阉掉）" \
+  || bad "已安装的 guard 能被 AI 覆盖成空壳 —— 所有约束一键解除"
+
+# 但开发模式（guard 跑自工作树，不在 plugin cache 里）必须能改 —— 否则没法开发 ratchet
+ro_expect allow Write "$(ro_json file_path "$PWD/bin/ratchet-guard" content x)" \
+  "开发模式下 guard 源码可改（否则没法开发 ratchet 自己）"
+
+# 但没声明只读区的项目，config.json 不该被无端锁住 —— 否则谁也配不了它
+NORO=$(mktemp -d); mkdir -p "$NORO/.ratchet"
+printf '{"preset":"standard"}' > "$NORO/.ratchet/config.json"
+got=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s/.ratchet/config.json","content":"x"},"cwd":"%s"}' "$NORO" "$NORO" \
+  | $BIN/ratchet-guard 2>/dev/null \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin).get("hookSpecificOutput")
+print(d["permissionDecision"] if d else "allow")')
+[ "$got" = "allow" ] && ok "allow  ← 未声明只读区时 config.json 可正常编辑" \
+  || bad "无只读区的项目里 config.json 被锁死 —— 那就没人配得了它"
+
 # hook 输出必须是干净的 JSON —— 任何 warning/噪声混进流里都会污染平台解析
 out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm install ghostpkg"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard 2>&1)
 echo "$out" | grep -qi "warning\|traceback" && bad "guard 输出混入噪声" "$out" || ok "guard 输出干净无噪声"
