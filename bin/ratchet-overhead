@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""
+ratchet-overhead — 机制税审计。给脚手架自己做体检。
+
+回答那个最要命的问题：这套机制跑三年会不会臃肿到喧宾夺主？
+
+原工程的答案是「会」，而且已经发生了：起手必读文件合计 247,366 B，
+其中 current.md 单文件 164,297 B 且仍在长；230 份 session 日志共 1.86 MB。
+按那条斜率外推一年，起手仪式本身就会撑爆上下文 —— 机制吃掉任务。
+
+治法不是「记得定期清理」（那是又一条会被忽略的软规则），而是把机制税
+本身变成一个被持续监控、会主动报警的指标。
+
+核心区分：
+  热区 — 每次会话都可能进上下文的东西。**必须恒定，与项目年龄无关（K4）。**
+  冷区 — 归档，只可检索、不自动加载。想长多大长多大，不花上下文。
+
+冷区膨胀无所谓，热区膨胀才是病。这个区分是整个反臃肿设计的支点。
+
+用法:
+  ratchet-overhead [--root DIR] [--budget BYTES]
+退出码:
+  0 健康 / 1 热区超预算（该跑 /slim 了）
+"""
+import argparse
+import os
+import sys
+
+HOT_BUDGET = 12 * 1024  # 热区总预算 12 KB（简报 2K + 宪法 4K + 最近 3 份日志 + 规则）
+RECENT_LOGS = 3         # 只有最近 N 份日志算热区，其余是冷区
+
+
+def size(p: str) -> int:
+    try:
+        return os.path.getsize(p)
+    except OSError:
+        return 0
+
+
+def walk(d: str) -> list[str]:
+    out = []
+    for root, dirs, files in os.walk(d):
+        dirs[:] = [x for x in dirs if x != ".git"]
+        out += [os.path.join(root, f) for f in files]
+    return out
+
+
+def human(n: int) -> str:
+    if n >= 1024 * 1024:
+        return f"{n / 1024 / 1024:.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--root", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    ap.add_argument("--budget", type=int, default=HOT_BUDGET)
+    a = ap.parse_args()
+    root = a.root
+
+    hot, cold = {}, {}
+
+    # 热区：宪法 + 规则 + state（简报由 state 渲染，另算）
+    for rel in (".ratchet/constitution.md", ".ratchet/state.json", ".ratchet/config.json",
+                "CLAUDE.md", "AGENTS.md"):
+        p = os.path.join(root, rel)
+        if os.path.isfile(p):
+            hot[rel] = size(p)
+    rules_dir = os.path.join(root, ".ratchet", "rules")
+    if os.path.isdir(rules_dir):
+        for p in walk(rules_dir):
+            hot[os.path.relpath(p, root)] = size(p)
+
+    # session 日志：最近 N 份算热区，其余全是冷区
+    logs = []
+    for base in ("track", "Worklog", ".ratchet/log"):
+        d = os.path.join(root, base)
+        if os.path.isdir(d):
+            logs += [p for p in walk(d) if p.endswith(".md")]
+    logs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    for i, p in enumerate(logs):
+        rel = os.path.relpath(p, root)
+        (hot if i < RECENT_LOGS else cold)[rel] = size(p)
+
+    # 冷区：计划 / 迭代 / 修订 —— 想多大多大，不进上下文
+    for base in ("PLAN", "iterations", ".ratchet/archive"):
+        d = os.path.join(root, base)
+        if os.path.isdir(d):
+            for p in walk(d):
+                cold[os.path.relpath(p, root)] = size(p)
+
+    hot_total, cold_total = sum(hot.values()), sum(cold.values())
+
+    print("机制税体检")
+    print("=" * 58)
+    print(f"\n🔥 热区（每次会话可能进上下文 · 必须恒定）  {human(hot_total)}")
+    for k, v in sorted(hot.items(), key=lambda x: -x[1])[:8]:
+        print(f"     {human(v):>9}  {k}")
+    if not hot:
+        print("     （空 —— 尚未 init）")
+
+    print(f"\n🧊 冷区（归档 · 只检索不加载 · 长多大都行）  {human(cold_total)}")
+    print(f"     {len(cold)} 个文件")
+    if logs:
+        print(f"     其中 session 日志 {len(logs)} 份（热区仅保留最近 {RECENT_LOGS} 份）")
+
+    print("\n" + "-" * 58)
+    pct = hot_total * 100 // a.budget if a.budget else 0
+    status = "🟢 健康" if hot_total <= a.budget else "🔴 超标"
+    print(f"热区 {human(hot_total)} / 预算 {human(a.budget)}  ({pct}%)  {status}")
+
+    if cold_total and hot_total:
+        print(f"冷热比 {cold_total / hot_total:.0f} : 1   "
+              f"（这个比值越大越好 —— 说明历史都归档了，没赖在上下文里）")
+
+    if hot_total > a.budget:
+        print(f"\n⚠️  热区超预算 {human(hot_total - a.budget)}。")
+        print("   机制正在吃掉本该属于任务的上下文。跑 /ratchet:slim 做减法：")
+        print("   - 长期零命中的规则 → 删")
+        print("   - 高频命中的软规则 → 升级成硬校验器，然后删掉原规则")
+        print("   - 宪法超 4 KB → 必须先删一条才能加一条")
+        return 1
+
+    print("\n热区不随项目年龄增长 —— 这是 K4 的承诺，由 schema 上限 + 冷热分离共同保证。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

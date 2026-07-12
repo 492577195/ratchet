@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""
+ratchet-state — 校验 .ratchet/state.json 是否符合 schema。
+
+这是 K1/K4 的执行者。schema 里写 `maxItems: 2` 本身不产生任何约束力 ——
+必须有人在写入时真的拒绝第 3 条，否则 state 会慢慢长胖，简报跟着膨胀，
+最后又变回那个 164 KB 的 current.md。
+
+零外部依赖：hook 的 shell 环境 PATH 很瘦，不能假设 jsonschema 装了。
+所以手写一个只覆盖本 schema 用到的关键字的校验器
+（required / type / enum / const / maxLength / maxItems / additionalProperties）。
+覆盖不全好过跑不起来 —— 但覆盖范围必须包含 maxLength/maxItems，那是命脉。
+
+用法:
+  ratchet-state                    # 校验 <project>/.ratchet/state.json
+  ratchet-state --state PATH
+  ratchet-state --hook             # PostToolUse 模式：读 stdin，只在改了 state.json 时校验
+退出码:
+  0 合法 / 1 非法 / 2 文件问题
+"""
+import argparse
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCHEMA = os.path.join(HERE, "..", "schema", "state.schema.json")
+
+_TYPES = {
+    "object": dict, "array": list, "string": str,
+    "integer": int, "number": (int, float), "boolean": bool, "null": type(None),
+}
+
+
+def _type_ok(val, spec) -> bool:
+    names = spec if isinstance(spec, list) else [spec]
+    for n in names:
+        py = _TYPES.get(n)
+        if py is None:
+            continue
+        # bool 是 int 的子类，别让 True 通过 integer 校验
+        if n in ("integer", "number") and isinstance(val, bool):
+            continue
+        if isinstance(val, py):
+            return True
+    return False
+
+
+def validate(node, schema, path="", errs=None) -> list[str]:
+    errs = errs if errs is not None else []
+
+    if "const" in schema and node != schema["const"]:
+        errs.append(f"{path or '/'}: 必须为 {schema['const']!r}，实得 {node!r}")
+    if "enum" in schema and node not in schema["enum"]:
+        errs.append(f"{path or '/'}: 必须是 {schema['enum']} 之一，实得 {node!r}")
+    if "type" in schema and not _type_ok(node, schema["type"]):
+        errs.append(f"{path or '/'}: 类型应为 {schema['type']}，实得 {type(node).__name__}")
+        return errs  # 类型都不对，再往下查没意义
+
+    if isinstance(node, str) and "maxLength" in schema:
+        if len(node) > schema["maxLength"]:
+            errs.append(
+                f"{path}: 超长 {len(node)} > {schema['maxLength']} 字符。"
+                f"这是 K1(简报 ≤2KB) 的硬约束 —— 写不下说明它属于「叙述」，"
+                f"该进 session 日志，不该进 state。"
+            )
+
+    if isinstance(node, list):
+        if "maxItems" in schema and len(node) > schema["maxItems"]:
+            errs.append(
+                f"{path}: 条目数 {len(node)} > 上限 {schema['maxItems']}。"
+                f"上限由 K1 字节预算反推得出，不是随便定的 —— 先处理掉旧的，再加新的。"
+            )
+        item_schema = schema.get("items")
+        if item_schema:
+            for i, item in enumerate(node):
+                validate(item, item_schema, f"{path}[{i}]", errs)
+
+    if isinstance(node, dict):
+        for r in schema.get("required", []):
+            if r not in node:
+                errs.append(f"{path}/{r}: 缺失必填字段")
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            for k in node:
+                if k not in props:
+                    errs.append(f"{path}/{k}: 未知字段（schema 不允许额外字段）")
+        for k, v in node.items():
+            if k in props:
+                validate(v, props[k], f"{path}/{k}", errs)
+
+    return errs
+
+
+def emit_hook(errs: list[str]) -> int:
+    """PostToolUse 模式：把校验结果回灌给模型，让它当场改，而不是留到后面爆炸。"""
+    if not errs:
+        print("{}")
+        return 0
+    reason = "state.json 不符合 schema：\n" + "\n".join(f"- {e}" for e in errs)
+    json.dump(
+        {"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": f"[ratchet-state] {reason}",
+        }},
+        sys.stdout, ensure_ascii=False,
+    )
+    print()
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--state")
+    ap.add_argument("--schema", default=SCHEMA)
+    ap.add_argument("--hook", action="store_true")
+    a = ap.parse_args()
+
+    path = a.state
+    if a.hook:
+        try:
+            payload = json.load(sys.stdin)
+        except Exception:
+            return emit_hook([])
+        fp = (payload.get("tool_input") or {}).get("file_path", "")
+        if not fp.endswith(os.path.join(".ratchet", "state.json")):
+            return emit_hook([])  # 改的不是 state.json，无事
+        path = fp
+
+    if not path:
+        root = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        path = os.path.join(root, ".ratchet", "state.json")
+
+    try:
+        schema = json.load(open(a.schema, encoding="utf-8"))
+    except OSError as e:
+        print(f"ratchet-state: 读不到 schema — {e}", file=sys.stderr)
+        return 2
+
+    try:
+        state = json.load(open(path, encoding="utf-8"))
+    except FileNotFoundError:
+        msg = f"未找到 {path}"
+        return emit_hook([msg]) if a.hook else (print(f"ratchet-state: {msg}", file=sys.stderr) or 2)
+    except json.JSONDecodeError as e:
+        msg = f"非法 JSON — {e}"
+        return emit_hook([msg]) if a.hook else (print(f"ratchet-state: {msg}", file=sys.stderr) or 1)
+
+    errs = validate(state, schema)
+    if a.hook:
+        return emit_hook(errs)
+
+    if errs:
+        print(f"❌ state.json 不合法（{len(errs)} 处）", file=sys.stderr)
+        for e in errs:
+            print(f"  - {e}", file=sys.stderr)
+        return 1
+    print("✅ state.json 合法")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
