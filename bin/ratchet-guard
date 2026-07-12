@@ -202,6 +202,121 @@ def extract_command(payload: dict) -> str:
     return ""
 
 
+# ── 只读区 ──────────────────────────────────────────────────────────
+# 在 .ratchet/config.json 里声明 AI 只许读、不许写的目录：
+#
+#     { "readonly_paths": ["../ratchet-eval"] }
+#
+# 为什么需要它：当 AI 被交给一个「跑测试 → 修代码 → 重跑」的自动循环时，
+# 它迟早会发现**改判据比改代码容易**。把红的用例改绿，循环就"成功"了。
+# 这不是恶意，是优化压力的自然走向 —— 所以不能靠在宪法里写一句「不许改测试」。
+# 能机器化的约束就不该写成文字，判据本身更得守。
+#
+# 边界（诚实说）：Bash 那条是启发式，挡的是「顺手就改了」，不是「铁了心要改」。
+# 真正兜底的是循环收尾时校验判据仓的 git 完整性 —— 那是确定性的，绕不过去。
+
+WRITE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
+
+# 写入型命令。故意不含 python/node —— 它们确实能写文件，但把它们算成写入动词，
+# 就会连「运行只读区里的脚本」都拦掉（自循环恰恰需要跑 eval 本身）。
+# 那种误伤会让人直接关掉整个机制，那时保护等于零。
+WRITE_CMDS = re.compile(r"\b(rm|mv|cp|touch|mkdir|tee|dd|truncate|chmod|chown)\b")
+SED_INPLACE = re.compile(r"\bsed\b[^;|&]*\s-i")
+GIT_WRITE = re.compile(r"\bgit\b[^;|&]*\b(commit|add|checkout|reset|restore|apply|rm|mv|stash|push)\b")
+
+
+def readonly_roots(root: str) -> list[str]:
+    try:
+        with open(os.path.join(root, ".ratchet", "config.json"), encoding="utf-8") as fh:
+            paths = json.load(fh).get("readonly_paths") or []
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return []
+    out = []
+    for p in paths:
+        if isinstance(p, str) and p:
+            out.append(os.path.realpath(os.path.join(root, os.path.expanduser(p))))
+    return out
+
+
+def _under(path: str, roots: list[str]) -> str | None:
+    """path 落在哪个只读区里。"""
+    ap = os.path.realpath(path)
+    for r in roots:
+        if ap == r or ap.startswith(r + os.sep):
+            return r
+    return None
+
+
+def write_targets(cmd: str) -> list[str]:
+    """命令想**写**到哪些路径去。
+
+    只收写入目标，不收所有出现过的路径 —— 否则 `cat ro/x.py > /tmp/y`（读只读区、
+    写临时文件）和 `./ro/bin/tool --run`（运行只读区里的程序）都会被误拦。
+    """
+    t = []
+
+    # 重定向：> target、>> target
+    t += re.findall(r">>?\s*([^\s;|&<>]+)", cmd)
+
+    # 写入型命令的参数（跳过选项）
+    for m in re.finditer(r"\b(?:rm|mv|cp|touch|mkdir|tee|truncate|chmod|chown)\b([^;|&]*)", cmd):
+        for tok in m.group(1).split():
+            if not tok.startswith("-"):
+                t.append(tok.strip("\"'"))
+
+    # sed -i：就地改写，目标是它的文件参数
+    for m in SED_INPLACE.finditer(cmd):
+        tail = cmd[m.end():]
+        for tok in tail.split():
+            if not tok.startswith("-"):
+                t.append(tok.strip("\"'"))
+
+    return [x for x in t if x]
+
+
+def check_readonly(payload: dict, root: str) -> str | None:
+    roots = readonly_roots(root)
+    if not roots:
+        return None
+
+    ti = payload.get("tool_input") or {}
+    tool = payload.get("tool_name") or ""
+
+    # 一、文件编辑类工具 —— AI 改代码的主要通路，路径是明写的，拦得干净利落
+    if tool in WRITE_TOOLS and isinstance(ti, dict):
+        fp = ti.get("file_path") or ti.get("notebook_path") or ""
+        if isinstance(fp, str) and fp:
+            hit = _under(os.path.join(root, fp), roots)
+            if hit:
+                return (f"{os.path.basename(hit)} 是只读区，不能改。\n"
+                        f"它是判据（或受保护的配置）—— 判据被改动，验证就失去意义。\n"
+                        f"该改的是被测代码，不是尺子。")
+
+    # 二、Bash —— 只看**写入目标**，读和执行一律放行
+    cmd = extract_command(payload)
+    if not cmd:
+        return None
+
+    for tgt in write_targets(cmd):
+        hit = _under(os.path.join(root, tgt), roots)
+        if hit:
+            return (f"这条命令会写入只读区 {os.path.basename(hit)}（目标：{tgt}）。\n"
+                    f"判据被改动，验证就失去意义。该改的是被测代码，不是尺子。")
+
+    # 三、git 的写子命令 + 只读区路径（`cd ro && git commit`、`git -C ro reset`）
+    if GIT_WRITE.search(cmd):
+        for tok in re.split(r"[\s;|&]+", cmd):
+            tok = tok.strip("\"'")
+            if not tok or tok.startswith("-"):
+                continue
+            hit = _under(os.path.join(root, tok), roots)
+            if hit:
+                return (f"这条命令会对只读区 {os.path.basename(hit)} 做 git 写操作。\n"
+                        f"判据被改动，验证就失去意义。")
+
+    return None
+
+
 def record_hit(root: str, rule_id: str, decision: str) -> None:
     """记一笔命中。这是棘爪释放的数据基础 —— 没有命中统计，减法就只能靠拍脑袋。
 
@@ -254,11 +369,18 @@ def main() -> int:
     except Exception:
         return emit(None)  # 读不懂就放行，guard 不该把会话卡死
 
+    root = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+
+    # 只读区先判 —— 它要拦 Edit/Write，而那些工具压根没有 command 字段，
+    # 放到 extract_command 之后就永远轮不到它。
+    ro = check_readonly(payload, root)
+    if ro:
+        return emit("deny", ro, "readonly", root)
+
     cmd = extract_command(payload)
     if not cmd:
         return emit(None)
 
-    root = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     scan = scan_text(cmd)
 
     for rid, pat, why in DENY:

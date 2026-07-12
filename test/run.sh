@@ -170,6 +170,64 @@ expect deny "ls && rm -rf /tmp/x"                    # 复合命令的后半段
 expect deny "ls; rm -rf /tmp/x"
 expect deny "rm -rf \"/tmp/my dir\""                 # 带空格的路径参数，仍是真删除
 
+# ─────────────────────────────────────────────────────────────
+echo
+echo "READONLY · 只读区（AI 不许改判据）"
+# ─────────────────────────────────────────────────────────────
+# 把 AI 交给「跑测试 → 修代码 → 重跑」的自动循环，它迟早会发现**改判据比改代码
+# 容易**：把红的用例改绿，循环就"成功"了。这不是恶意，是优化压力的自然走向。
+# 所以不能靠在宪法里写一句「不许改测试」—— 能机器化的约束就不该写成文字。
+RO=$(mktemp -d)        # 扮演被保护的判据仓
+RP=$(mktemp -d)        # 扮演工作项目
+mkdir -p "$RP/.ratchet" "$RO/cases"
+printf '{"readonly_paths":["%s"]}' "$RO" > "$RP/.ratchet/config.json"
+echo "assert x == 1" > "$RO/cases/truth.py"
+
+ro_decide() {  # ro_decide <tool_name> <tool_input_json>
+  printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$1" "$2" "$RP" \
+  | $BIN/ratchet-guard 2>/dev/null \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin).get("hookSpecificOutput")
+print(d["permissionDecision"] if d else "allow")'
+}
+ro_expect() {  # ro_expect <期望> <tool> <input> <说明>
+  got=$(ro_decide "$2" "$3")
+  [ "$got" = "$1" ] && ok "$1  ← $4" || bad "期望 $1 实得 $got  ← $4"
+}
+# zsh 会对裸花括号做 brace expansion，把 python 字典字面量吃掉 —— 别在命令行里写 {}。
+ro_json() {  # ro_json k1 v1 k2 v2 … → JSON 对象
+  python3 - "$@" <<'PY'
+import json, sys
+a = sys.argv[1:]
+print(json.dumps(dict(zip(a[::2], a[1::2])), ensure_ascii=False))
+PY
+}
+ro_cmd() { ro_json command "$1"; }
+
+# 改判据 —— 一律拦死
+ro_expect deny Write "$(ro_json file_path "$RO/cases/truth.py" content 'assert True')" \
+  "Write 改判据文件"
+ro_expect deny Edit "$(ro_json file_path "$RO/cases/truth.py" old_string 1 new_string 2)" \
+  "Edit 改判据文件"
+ro_expect deny Bash "$(ro_cmd "echo pass > $RO/cases/truth.py")"     "重定向覆盖判据"
+ro_expect deny Bash "$(ro_cmd "sed -i '' s/1/2/ $RO/cases/truth.py")" "sed -i 就地改判据"
+ro_expect deny Bash "$(ro_cmd "rm $RO/cases/truth.py")"               "删掉判据"
+ro_expect deny Bash "$(ro_cmd "cp /tmp/fake.py $RO/cases/truth.py")"  "拿假判据覆盖"
+ro_expect deny Bash "$(ro_cmd "git -C $RO checkout -- cases/truth.py")" "git 回滚判据"
+
+# 但读和执行必须放行 —— 自循环要能跑 eval、要能读懂自己为什么红。
+# 拦错这一栏，整个机制会被直接关掉，那时保护等于零。
+ro_expect allow Bash "$(ro_cmd "cat $RO/cases/truth.py")"              "读判据"
+ro_expect allow Bash "$(ro_cmd "grep -r assert $RO/cases")"            "搜判据"
+ro_expect allow Bash "$(ro_cmd "$RO/bin/ratchet-eval --target .")"     "运行只读区里的程序"
+ro_expect allow Bash "$(ro_cmd "cat $RO/cases/truth.py > /tmp/copy.py")" "读只读区、写别处"
+ro_expect allow Bash "$(ro_cmd "git -C $RO status")"                   "git 读操作"
+ro_expect allow Read "$(ro_json file_path "$RO/cases/truth.py")"       "Read 工具读判据"
+
+# 工作区内正常写入不受影响
+ro_expect allow Write "$(ro_json file_path "$RP/src/app.py" content x)" \
+  "工作区内正常写入不受影响"
+
 # hook 输出必须是干净的 JSON —— 任何 warning/噪声混进流里都会污染平台解析
 out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm install ghostpkg"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard 2>&1)
 echo "$out" | grep -qi "warning\|traceback" && bad "guard 输出混入噪声" "$out" || ok "guard 输出干净无噪声"

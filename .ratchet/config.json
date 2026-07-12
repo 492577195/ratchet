@@ -1,4 +1,5 @@
 {
   "preset": "complex",
-  "context_window": 1000000
+  "context_window": 1000000,
+  "readonly_paths": ["../ratchet-eval"]
 }
