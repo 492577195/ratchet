@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""
+ratchet-brief — 把 state.json 渲染成会话起手简报。
+
+这是「状态与叙述分离」的渲染端：state.json 是唯一真源，简报由它生成。
+简报不落盘、不可手工编辑，因此永不过期 —— 原工程 164 KB 的 current.md
+和 31 KB 的正则校验脚本，大半检查项在这个设计下不是被修好，而是不再需要存在。
+
+输出硬上限 2 KB（K1）。schema 的 maxItems/maxLength 已在结构上保证不会超，
+本脚本再做一次运行时断言：超了就是 schema 被绕过了，必须暴露而不是静默截断。
+
+用法:
+  ratchet-brief [--state PATH] [--budget BYTES]
+  ratchet-brief --check          # 只校验预算，不输出简报（CI/单测用）
+退出码:
+  0 正常
+  1 state.json 不存在或非法
+  2 超出字节预算（K1 被破坏）
+"""
+import argparse
+import json
+import os
+import sys
+
+BUDGET = 2048  # K1: 起手注入 ≤ 2 KB
+
+
+def find_state(explicit=None):
+    if explicit:
+        return explicit
+    d = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    return os.path.join(d, ".ratchet", "state.json")
+
+
+def render(st):
+    L = []
+    cur = st.get("current", {})
+    it, stage = cur.get("iteration"), cur.get("stage")
+
+    head = "# 当前状态"
+    if it or stage:
+        head += f"  ·  {it or ''}{' / ' if it and stage else ''}{stage or ''}"
+    L.append(head)
+    L.append("")
+    L.append(f"**在做**：{cur.get('task', '(未设置)')}")
+    L.append(f"**下一步**：{cur.get('next', '(未设置)')}")
+
+    blocked = st.get("blocked") or []
+    if blocked:
+        L.append("")
+        L.append("## 🚫 阻塞")
+        for b in blocked:
+            since = f"（{b['since']} 起）" if b.get("since") else ""
+            L.append(f"- {b['what']}{since} → 解除条件：{b['unblock']}")
+
+    pend = st.get("pending_user") or []
+    if pend:
+        L.append("")
+        L.append("## ❓ 等你拍板")
+        for p in pend:
+            L.append(f"- {p['question']}")
+
+    dec = st.get("recent_decisions") or []
+    if dec:
+        L.append("")
+        L.append("## 🗳️ 最近决策")
+        for d in dec:
+            L.append(f"- {d['decision']} —— {d['why']}")
+
+    sess = st.get("session") or {}
+    if sess.get("log_written") is False:
+        L.append("")
+        L.append(f"⚠️ 上次会话（s-{sess.get('last', '?')}）的日志未写，先补写再开新工作。")
+
+    return "\n".join(L) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--state")
+    ap.add_argument("--budget", type=int, default=BUDGET)
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__)
+        return 0
+
+    path = find_state(a.state)
+    if not os.path.isfile(path):
+        print(f"ratchet: 未找到 {path}（先跑 /ratchet:init）", file=sys.stderr)
+        return 1
+    try:
+        st = json.load(open(path, encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"ratchet: state.json 非法 JSON — {e}", file=sys.stderr)
+        return 1
+
+    out = render(st)
+    n = len(out.encode("utf-8"))
+
+    if n > a.budget:
+        print(
+            f"ratchet: 简报 {n} B 超出预算 {a.budget} B（K1 被破坏）。"
+            f"schema 的 maxItems/maxLength 应已阻止这种情况 —— 检查 state.json 是否绕过了 schema 校验。",
+            file=sys.stderr,
+        )
+        return 2
+
+    if a.check:
+        print(f"ok: {n}/{a.budget} B ({n * 100 // a.budget}% of K1 budget)")
+        return 0
+
+    sys.stdout.write(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

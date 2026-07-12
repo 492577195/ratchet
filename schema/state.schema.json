@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dacong/ratchet/schema/state.schema.json",
+  "title": "ratchet project state",
+  "description": "项目状态的唯一真源。会话简报由本文件渲染而成（禁止手工编辑简报，它会被覆盖）。本 schema 刻意不含任何随项目年龄增长的字段，且对所有数组设 maxItems、对所有文本设 maxLength —— 这是 K4（机制上下文成本 O(1)，与项目年龄无关）的结构性保证：不靠人记得清理，靠机器直接拒绝。装不下的内容属于『叙述』，应写入 session 日志，不属于『状态』。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "preset", "current", "updated_at"],
+
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "schema 版本。变更需提供迁移脚本。"
+    },
+
+    "preset": {
+      "enum": ["standard", "complex"],
+      "description": "档位。standard=普通项目；complex=多会话/有发布节奏的重型项目。决定哪些 hook 与目录生效。"
+    },
+
+    "current": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "next"],
+      "description": "当前状态。这是起手简报的主体，也是唯一「必填」的部分。",
+      "properties": {
+        "task": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "现在在做什么。一句话。写不下说明任务没拆够（违反纪律：不闷头干）。"
+        },
+        "next": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "下一步做什么。一句话。"
+        },
+        "iteration": {
+          "type": ["string", "null"],
+          "maxLength": 40,
+          "description": "当前迭代号（如 v0.2.0）。仅 complex 档使用；standard 档为 null。"
+        },
+        "stage": {
+          "type": ["string", "null"],
+          "enum": ["backlog", "planning", "implementation", "testing", "review", "release", "retro", null],
+          "description": "SDLC 阶段。仅 complex 档使用；standard 档为 null。"
+        }
+      }
+    },
+
+    "blocked": {
+      "type": "array",
+      "maxItems": 2,
+      "default": [],
+      "description": "跨会话级阻塞。上限 2 —— 超过 2 个阻塞说明项目已停摆，该停下来处理而非继续记录。上限由 K1 字节预算反推得出。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["what", "unblock"],
+        "properties": {
+          "what": { "type": "string", "maxLength": 35, "description": "被什么挡住了" },
+          "unblock": { "type": "string", "maxLength": 35, "description": "解除条件（可判定的，不是『等待中』）" },
+          "since": { "type": "string", "format": "date", "description": "阻塞起始日" }
+        }
+      }
+    },
+
+    "pending_user": {
+      "type": "array",
+      "maxItems": 2,
+      "default": [],
+      "description": "待用户拍板的事项。上限 2 —— 攒着不问是反模式，攒到第 3 个就该停下来问。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["question"],
+        "properties": {
+          "question": { "type": "string", "maxLength": 45, "description": "要用户决定什么" },
+          "raised": { "type": "string", "format": "date" }
+        }
+      }
+    },
+
+    "recent_decisions": {
+      "type": "array",
+      "maxItems": 3,
+      "default": [],
+      "description": "最近 3 条关键决策，滚动淘汰。这是给下个会话的『为什么现在长这样』。更早的决策不在这里 —— 它们在 session 日志与 revisions 里，需要时按需检索，不进上下文。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["decision", "why"],
+        "properties": {
+          "decision": { "type": "string", "maxLength": 30, "description": "决定了什么" },
+          "why": { "type": "string", "maxLength": 25, "description": "为什么（不写『因为更好』这种废话）" },
+          "date": { "type": "string", "format": "date" }
+        }
+      }
+    },
+
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "会话计数。由 SessionEnd hook 自动维护，不手工改。",
+      "properties": {
+        "last": { "type": "integer", "minimum": 0, "description": "最近一次 session 编号" },
+        "last_date": { "type": "string", "format": "date" },
+        "log_written": {
+          "type": "boolean",
+          "description": "最近一次会话的日志是否已写。false 时 SessionStart 会提示补写（纪律：工作留痕）。"
+        }
+      }
+    },
+
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "本文件最后更新时间。由 hook 自动写入。"
+    }
+  }
+}
