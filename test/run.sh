@@ -306,6 +306,51 @@ hookpay "$PWD/.ratchet/state.json" | $BIN/ratchet-state --hook 2>/dev/null | gre
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "HOOK·协议 · 每个事件只准说平台听得懂的话"
+# ─────────────────────────────────────────────────────────────
+# 同一个病根，本项目已经栽了两次：凭印象写 hook 输出格式。
+#   1. PostToolUse 误用 permissionDecision（PreToolUse 专用）→ 静默丢弃，门禁从未生效
+#   2. SessionEnd  误用 hookSpecificOutput.additionalContext → 平台校验失败，每次收尾喷红字
+# 单元测试抓不到这类 bug，因为它们测的是「脚本算得对不对」，不是「平台认不认」。
+# 这一段按事件逐个钉死输出格式。依据 https://code.claude.com/docs/en/hooks：
+#   SessionStart → hookSpecificOutput.additionalContext ✅（可注入上下文）
+#   SessionEnd   → 无 decision control，禁 hookSpecificOutput，只认 universal 字段
+#                  （continue / stopReason / suppressOutput / systemMessage / terminalSequence）
+UNIVERSAL='continue stopReason suppressOutput systemMessage terminalSequence'
+
+# SessionEnd（digest）：必须落盘，且绝不能吐 hookSpecificOutput
+DG="$TMP/dg"; mkdir -p "$DG"
+$BIN/ratchet-init --preset standard --root "$DG" >/dev/null 2>&1
+dgout=$(printf '{"cwd":"%s","transcript_path":"%s"}' "$DG" "$TMP/cmd.jsonl" | $BIN/ratchet-digest --hook 2>/dev/null)
+
+echo "$dgout" | grep -q "hookSpecificOutput" \
+  && bad "SessionEnd 吐了 hookSpecificOutput —— 平台会校验失败（Invalid input）" "$dgout" \
+  || ok "SessionEnd 未吐 hookSpecificOutput（它没有 decision control）"
+
+echo "$dgout" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+allowed = set('$UNIVERSAL'.split())
+sys.exit(0 if set(d) <= allowed else 1)" \
+  && ok "SessionEnd 输出只含 universal 字段" \
+  || bad "SessionEnd 出现了非 universal 字段 —— 平台会拒绝整份输出" "$dgout"
+
+ls "$DG/.ratchet/log/"*.md >/dev/null 2>&1 \
+  && ok "SessionEnd 真的落了日志草稿（收尾留痕的本体）" \
+  || bad "SessionEnd 没落盘 —— 收尾留痕失效"
+
+# SessionStart（brief）：这个事件**允许** hookSpecificOutput，别改错了方向
+btext=$(CLAUDE_PROJECT_DIR="$DG" $BIN/ratchet-brief --hook 2>/dev/null)
+echo "$btext" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+h = d.get('hookSpecificOutput') or {}
+sys.exit(0 if not d or (h.get('hookEventName') == 'SessionStart' and 'additionalContext' in h) else 1)" \
+  && ok "SessionStart 用 hookSpecificOutput.additionalContext（该事件支持注入）" \
+  || bad "SessionStart 输出不符协议" "$btext"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "ROBUSTNESS · 坏输入绝不能让 hook 崩掉"
 # ─────────────────────────────────────────────────────────────
 printf 'not json\n{"type":"assistant"}\n' > "$TMP/bad.jsonl"
