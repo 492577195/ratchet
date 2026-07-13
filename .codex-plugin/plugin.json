@@ -1,6 +1,6 @@
 {
   "name": "ratchet",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "AI 协作工程脚手架。把可机器化的工程纪律下沉为确定性门禁，并保证机制的上下文成本与项目年龄无关。",
   "author": {
     "name": "zhang"
