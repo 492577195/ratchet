@@ -1,0 +1,64 @@
+name: Bug 报告
+description: 某个门禁没拦住、脚本报错、或行为与 README 不符
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报 bug。**最关键的一条信息是你用的哪个平台** —— CC 和 Codex 的 hook 行为不同，很多问题只在其中一边出现。
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      description: hook 协议在两个平台上不一样，这决定了排查方向
+      options:
+        - Claude Code
+        - OpenAI Codex
+        - 两个都复现
+        - 命令行直接跑 bin/ 下的脚本
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: "`cat VERSION` 的输出"
+      placeholder: "0.1.4"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 实际行为。如果是门禁没拦住，请贴出它放行的那条命令
+      placeholder: |
+        我让 AI 执行 xxx，ratchet-guard 应该拦住但放行了。
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 你期望的行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 最小复现步骤
+      description: 能让别人复现的最短路径。能贴 `echo '{...}' | ./bin/ratchet-xxx` 的命令最好
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 报错栈、`.ratchet/state.json` 片段、`bin/ratchet-overhead` 输出等。**注意脱敏**
+    validations:
+      required: false

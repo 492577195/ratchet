@@ -1,0 +1,52 @@
+name: 功能提议
+description: 提议一个新的校验器、skill、或机制改进
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        本项目的核心立场：**能机器化的纪律，不许写成文字规则。**
+        所以下面第三个问题是最重要的一个 —— 如果你的提议能变成校验器，它就应该是校验器。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你踩了什么坑
+      description: 从**具体的失败**说起，不要从解决方案说起。AI 做了什么？造成了什么后果？
+      placeholder: |
+        AI 第三次把 xxx 改坏了。每次都得手工回滚。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你的提议
+    validations:
+      required: true
+
+  - type: dropdown
+    id: enforceable
+    attributes:
+      label: 这条能写成确定性校验器吗
+      description: 校验器 = 机器能判定、能拒绝、能写测试。规则 = 只能靠模型自觉遵守，会退化
+      options:
+        - 能 —— 机器可以判定并直接拒绝
+        - 不能 —— 属于语义判断，只能写成规则
+        - 不确定，想先讨论
+    validations:
+      required: true
+
+  - type: textarea
+    id: cost
+    attributes:
+      label: 它会让热区变大吗
+      description: |
+        热区 = 每次会话进上下文的文件（宪法 / state / 起手简报）。
+        热区必须与项目年龄无关 —— 这是本项目存在的理由。
+        如果你的提议要往宪法里加字，请说明**删掉哪一条来腾位置**（硬上限 4,096 B）
+      placeholder: |
+        不会，它是 bin/ 下的校验器，不进上下文。
+        或：会，需要往宪法加 2 行，建议删掉「xxx」那条（已长期零命中）。
+    validations:
+      required: true

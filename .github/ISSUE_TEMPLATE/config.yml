@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 先读贡献指南
+    url: https://github.com/492577195/ratchet/blob/main/CONTRIBUTING.md
+    about: 「什么样的改动会被拒绝」那一节能省掉一次白干
+  - name: 安装装不上？
+    url: https://github.com/492577195/ratchet/blob/main/README.md
+    about: 本仓是私有仓 —— 必须是协作者，且本机配好 SSH key，简写 URL 会 404
