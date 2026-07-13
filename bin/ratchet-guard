@@ -136,8 +136,8 @@ INTERPRETERS = {
 }
 
 
-def scan_text(cmd: str) -> str:
-    """返回真正用于危险模式匹配的文本。
+def scan_text(cmd: str) -> tuple[str, str | None]:
+    """返回 (用于危险模式匹配的文本, 保守回退的原因或 None)。
 
     首版对整条命令原文做匹配，于是 `printf 'rm -rf x' > f` 这种只是**提到**危险串、
     根本不执行它的命令也被 deny —— 写文档、打补丁、grep 代码全会被拦。
@@ -151,13 +151,20 @@ def scan_text(cmd: str) -> str:
 
     唯一放行的，是危险串纯粹作为普通命令的引号字符串参数出现。
     含命令替换（$(…) / 反引号）的 token 不剔除 —— 那里面的东西是会跑的。
+
+    **回退原因要带出去。** 首版只返回文本，于是回退触发的拦截和真·危险动作的
+    拦截长得一模一样：命令里只是**提到** rm -rf（写 commit message、写文档），
+    却收到「递归强制删除。要删就明确列出路径」—— 理由完全对不上现场。
+    实测后果：连读得懂源码的 agent 都误判成 guard 有 bug，转头提了个「放松
+    heredoc 匹配」的错误修法。理由说不清楚的门禁，会自己训练用户去绕过它。
     """
     if "<<" in cmd:
-        return cmd
+        return cmd, "heredoc"
 
     # 分隔符必须原样留在重建结果里 —— curl-pipe-sh 这类规则正是靠管道符识别的，
     # 切掉分隔符会让它们悄悄失效（首版这么写，`curl … | sh` 直接从 ask 掉成 allow）。
     out = []
+    fallback = None
     for sc in re.split(r"(\|\||&&|[;|&\n])", cmd):
         if re.fullmatch(r"\|\||&&|[;|&\n]", sc or ""):
             out.append(sc)          # 分隔符原样保留
@@ -169,17 +176,40 @@ def scan_text(cmd: str) -> str:
             toks = shlex.split(sc)
         except ValueError:
             out.append(sc)          # 引号不闭合 → 保守
+            fallback = fallback or "unbalanced-quote"
             continue
         if not toks:
             continue
         if os.path.basename(toks[0]) in INTERPRETERS:
             out.append(sc)          # 参数即代码 → 保守
+            fallback = fallback or "interpreter"
             continue
         out.append(" ".join(
             t for t in toks
             if not re.search(r"\s", t) or re.search(r"\$\(|`", t)
         ))
-    return " ".join(out)
+    return " ".join(out), fallback
+
+
+# 回退触发拦截时，附在理由后面。目的不是放行，是让人看懂**为什么**被拦，
+# 以及**正确的出路是什么** —— 否则唯一看起来管用的出路就是 --no-verify。
+FALLBACK_NOTE = {
+    "heredoc": (
+        "\n\n⚠️ 注意：这条命令含 heredoc（<<），guard 无法安全判断里面的内容会不会被"
+        "喂进解释器执行，因此按**原文**匹配危险模式。\n"
+        "如果那串危险文本只是文档 / commit message / 字符串内容，并不真的执行 —— "
+        "把它写进文件，再用 `-F <file>`（git commit）或从文件读入，即可正常通过。\n"
+        "这不是 bug，是有意的保守：漏拦远比误拦严重。"
+    ),
+    "unbalanced-quote": (
+        "\n\n⚠️ 注意：这条命令引号不闭合，guard 无法切词，因此按**原文**匹配危险模式。"
+        "先把引号配平再试。"
+    ),
+    "interpreter": (
+        "\n\n⚠️ 注意：命令位是解释器 / 包装器（sh、python、eval、xargs…），"
+        "它的参数就是要执行的代码，因此按**原文**匹配，不剔除引号内字面量。"
+    ),
+}
 
 
 def extract_command(payload: dict) -> str:
@@ -408,11 +438,12 @@ def main() -> int:
     if not cmd:
         return emit(None)
 
-    scan = scan_text(cmd)
+    scan, fallback = scan_text(cmd)
+    note = FALLBACK_NOTE.get(fallback or "", "")
 
     for rid, pat, why in DENY:
         if pat.search(scan):
-            return emit("deny", why, rid, root)
+            return emit("deny", why + note, rid, root)
 
     slop = check_install(scan, root)
     if slop:
@@ -420,7 +451,7 @@ def main() -> int:
 
     for rid, pat, why in ASK:
         if pat.search(scan):
-            return emit("ask", why, rid, root)
+            return emit("ask", why + note, rid, root)
 
     return emit(None)
 

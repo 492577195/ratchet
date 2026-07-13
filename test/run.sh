@@ -163,6 +163,44 @@ expect deny "bash -c 'git reset --hard HEAD~3'"
 expect deny "python3 -c \"os.system('rm -rf /')\""   # 解释器不限于 shell
 expect deny 'echo "$(rm -rf /tmp/x)"'                # 命令替换里的东西会跑
 expect deny 'echo `rm -rf /tmp/x`'                   # 反引号同理
+
+# ── 保守回退必须自报家门 ──────────────────────────────────────
+# 溯源：2026-07-13, s-3。用 `git commit -m "$(cat <<'EOF' … EOF)"` 提交，
+# commit message 里**描述** guard 拦 rm -rf 的功能 —— 被 deny。
+#
+# 拦得对：含 heredoc 时 guard 看不进去（内容可能被喂进解释器），按原文匹配是
+# 有意的保守，漏拦远比误拦严重。**所以下面第一条断言是 deny，不是 allow。**
+#
+# 错的是理由：它说「递归强制删除。要删就明确列出路径」，可现场根本没在删东西。
+# 后果实测：连读得懂源码的 agent 都误判成 guard 有 bug，转头提议放松 heredoc 匹配。
+# 一个理由说不清楚的门禁，会自己训练用户去 --no-verify。
+reason() {  # reason <命令> -> permissionDecisionReason 原文
+  printf '{"tool_name":"Bash","tool_input":{"command":%s},"cwd":"%s"}' \
+    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" "$GTMP" \
+  | $BIN/ratchet-guard 2>/dev/null \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin).get("hookSpecificOutput")
+print(d["permissionDecisionReason"] if d else "")'
+}
+
+HEREDOC_CMD='git commit -m "$(cat <<EOF
+docs: 说明 guard 会拦 rm -rf
+EOF
+)"'
+expect deny "$HEREDOC_CMD"                           # 保守回退：仍然拦，不放松
+case "$(reason "$HEREDOC_CMD")" in
+  *heredoc*|*"-F"*) ok "heredoc 回退时理由自报家门，并给出 -F 出路" ;;
+  *) bad "heredoc 触发的拦截，理由里没说明这是保守回退" "$(reason "$HEREDOC_CMD")" ;;
+esac
+
+# 正确出路必须真的走得通 —— 否则「给了出路」只是嘴上说说
+expect allow "git commit -F /tmp/msg.txt"
+
+# 真·危险动作的理由里不许混进回退说明（那是噪声，会稀释真正的警告）
+case "$(reason 'rm -rf /tmp/foo')" in
+  *heredoc*) bad "真·危险动作的理由被回退说明污染" ;;
+  *) ok "真·危险动作的理由干净，无回退噪声" ;;
+esac
 expect deny "sudo rm -rf /var/log"                   # 包装器后面跟的是真命令
 expect deny "env FOO=1 rm -rf /tmp/x"
 expect deny "xargs rm -rf < list.txt"
