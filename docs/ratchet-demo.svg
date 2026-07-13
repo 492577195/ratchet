@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="100%" height="100%">
+  <defs>
+    <style>
+      /* 定义齿轮的恒速旋转动画：8个齿，4秒转一圈，即每0.5秒过一个齿 */
+      .wheel {
+        transform-origin: 150px 150px;
+        animation: spin 4s linear infinite;
+      }
+      /* 定义棘爪的跳动动画：配合齿轮，每0.5秒抬起并迅速落下 */
+      .pawl {
+        transform-origin: 250px 70px;
+        animation: click 0.5s cubic-bezier(.17,.89,.32,1.28) infinite;
+      }
+      @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
+      @keyframes click {
+        0% { transform: rotate(0deg); }
+        70% { transform: rotate(-22deg); } /* 被平缓的齿面慢慢顶起 */
+        75% { transform: rotate(5deg); }   /* 越过最高点，受弹簧力迅速弹下 */
+        100% { transform: rotate(0deg); }
+      }
+    </style>
+    
+    <g id="tooth">
+      <path d="M 150 70 C 170 50, 185 45, 185 45 L 180 70 Z" fill="#0366d6" />
+    </g>
+  </defs>
+
+  <g class="wheel">
+    <circle cx="150" cy="150" r="80" fill="#0366d6" />
+    <use href="#tooth" transform="rotate(0 150 150)" />
+    <use href="#tooth" transform="rotate(45 150 150)" />
+    <use href="#tooth" transform="rotate(90 150 150)" />
+    <use href="#tooth" transform="rotate(135 150 150)" />
+    <use href="#tooth" transform="rotate(180 150 150)" />
+    <use href="#tooth" transform="rotate(225 150 150)" />
+    <use href="#tooth" transform="rotate(270 150 150)" />
+    <use href="#tooth" transform="rotate(315 150 150)" />
+    <circle cx="150" cy="150" r="15" fill="#ffffff" stroke="#24292e" stroke-width="4"/>
+  </g>
+
+  <g class="pawl">
+    <path d="M 250 70 L 220 50 L 190 55 L 240 85 Z" fill="#d73a49" stroke="#b31d28" stroke-width="2"/>
+    <circle cx="250" cy="70" r="10" fill="#ffffff" stroke="#24292e" stroke-width="4"/>
+    <circle cx="250" cy="70" r="4" fill="#24292e" />
+  </g>
+
+  <text x="200" y="260" font-family="sans-serif" font-size="16" fill="#586069" text-anchor="middle">
+    棘爪在平滑面滑动 (允许正转)
+  </text>
+  <text x="200" y="285" font-family="sans-serif" font-size="16" fill="#586069" text-anchor="middle">
+    卡在垂直面 (阻止反转)
+  </text>
+</svg>
