@@ -361,17 +361,42 @@ import json,sys
 rec={'type':'assistant','message':{'model':'claude-opus-4-8','usage':{'input_tokens':5,'output_tokens':9},
  'content':[{'type':'tool_use','name':'Bash','input':{'command':'pytest -q'}}]}}
 open(sys.argv[1],'w').write(json.dumps(rec)+chr(10))" "$PROJ/t.jsonl"
-printf '{"transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
+printf '{"session_id":"S-1","transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
 [ -f "$PROJ/.ratchet/log/"*"-s4.md" ] 2>/dev/null && ok "SessionEnd 自动生成 s-4 日志草稿" || bad "未生成日志草稿"
 lw=$(python3 -c "import json;print(json.load(open('$PROJ/.ratchet/state.json'))['session']['log_written'])")
 [ "$lw" = "False" ] && ok "log_written 置为 false（决策段待补）" || bad "log_written 未置位"
 $BIN/ratchet-brief --state "$PROJ/.ratchet/state.json" | grep -q "日志未写" \
   && ok "下次起手简报顶出「日志未写」提醒（留痕不靠模型记性）" || bad "简报未提醒补写日志"
-# 幂等：resume 重复触发不该覆盖已写的日志
-printf '{"transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
+# resume（同一 session_id 再次收尾）：不覆盖日志，不吃编号，不谎报。
+#
+# 溯源：首版 `n = last+1` 无脑加一，写文件时撞名就静默跳过，却照样递增 last、
+# 照样报告「已生成日志草稿」—— 什么都没写，却说写了。而**上一版的这条测试**
+# 用的是 `cnt -le 2` 这种宽松断言，文件数不涨照样通过，正好把 bug 放过去了。
+# 断言要钉在「会话编号」和「说的话」上，不是文件计数。
+sm=$(printf '{"session_id":"S-1","transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook)
+printf '%s' "$sm" | grep -q "未覆盖" \
+  && ok "resume 不谎报（日志已存在就说『未覆盖』，绝不谎称『已生成』）" \
+  || bad "resume 谎报了「已生成」—— 什么都没写却说写了" "$sm"
+n=$(python3 -c "import json;print(json.load(open('$PROJ/.ratchet/state.json'))['session']['last'])")
+[ "$n" = "4" ] && ok "resume 不吃会话编号（last 仍为 4）" \
+  || bad "resume 白吃了编号：last=${n}（应为 4）—— 日志序列会留下空洞"
 cnt=$(ls "$PROJ/.ratchet/log/" | wc -l | tr -d ' ')
-[ "$cnt" -le 2 ] && ok "重复触发不覆盖已有日志（resume 安全）" || bad "重复触发产生了 $cnt 份日志"
-rm -rf "$PROJ"
+[ "$cnt" = "1" ] && ok "resume 不覆盖、不新增日志" || bad "resume 产生了 $cnt 份日志"
+
+# 新会话（不同 session_id）：必须递增，且绝不覆盖别人的日志
+printf '{"session_id":"S-2","transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
+n=$(python3 -c "import json;print(json.load(open('$PROJ/.ratchet/state.json'))['session']['last'])")
+[ "$n" = "5" ] && ok "新会话递增编号（s-5）" || bad "新会话未递增：last=${n}"
+[ -f "$PROJ/.ratchet/log/"*"-s5.md" ] 2>/dev/null && ok "新会话落了独立日志" || bad "新会话未落日志"
+
+# state 与 log 不同步（state 被手工改过）时，绝不覆盖已有日志 —— 顺延到空位
+python3 -c "
+import json;p='$PROJ/.ratchet/state.json';d=json.load(open(p))
+d['session']['last']=3;d['session']['id']='S-old';json.dump(d,open(p,'w'),ensure_ascii=False)"
+printf '{"session_id":"S-3","transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
+n=$(python3 -c "import json;print(json.load(open('$PROJ/.ratchet/state.json'))['session']['last'])")
+[ "$n" = "6" ] && ok "编号撞车时顺延到空位（不覆盖既有日志）" || bad "编号撞车未顺延：last=${n}（应为 6）"
+rm -r "$PROJ"
 
 # ─────────────────────────────────────────────────────────────
 echo
@@ -420,6 +445,68 @@ keep=$(python3 -c "import json;print(json.load(open('$PJ/.ratchet/state.json'))[
 printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /x"},"cwd":"%s"}' "$PJ" | $BIN/ratchet-guard >/dev/null
 [ -f "$PJ/.ratchet/hits.jsonl" ] && ok "guard 命中写入 hits.jsonl（棘爪释放的数据基础）" || bad "未记录命中"
 $BIN/ratchet-audit --root "$PJ" >/dev/null 2>&1 && ok "ratchet-audit 可运行" || bad "ratchet-audit 失败"
+
+# ── 棘轮触发器：命中 → 起手顶到眼前 → 可消解 ──────────────────
+# 溯源：3 个真实工程跑下来，rules/ 共 0 条 —— 棘轮零转化。
+# 根因不是「用户不勤快」，是机制不对称：留痕/门禁/状态校验全是 hook 自动跑的，
+# 唯独「失败 → 永久约束」指望人想起来，而失败随会话上下文一起蒸发。
+# guard 每次命中都写了 hits.jsonl，机器写的、零歧义 —— 只是从来没人消费。
+PS="$PJ/.ratchet/state.json"
+$BIN/ratchet-brief --state "$PS" | grep -q "棘轮化" \
+  && ok "有未处理命中时，起手简报顶出提示（棘轮的触发器）" \
+  || bad "有命中却不提示 —— 棘轮仍然只能靠自觉"
+
+# 消解路径：棘轮只进不退是熵增引擎，提示只增不减同样是。
+# 没有退路的提示会被学会无视 —— 那比没有提示更糟：照吃注意力，不产生约束。
+$BIN/ratchet-audit --root "$PJ" --ack-all >/dev/null 2>&1
+$BIN/ratchet-brief --state "$PS" | grep -q "棘轮化" \
+  && bad "--ack 后提示仍在 —— 棘爪松不开" \
+  || ok "--ack 后提示消失（棘爪能松开）"
+
+# 向后兼容：老的 hits.jsonl 没有 ratcheted 字段，必须视为「未处理」
+printf '{"rule":"sudo","decision":"ask","at":"2026-07-13T00:00:00+00:00"}\n' >> "$PJ/.ratchet/hits.jsonl"
+$BIN/ratchet-brief --state "$PS" | grep -q "棘轮化" \
+  && ok "缺 ratcheted 字段的老命中视为未处理（向后兼容）" \
+  || bad "老格式命中被当成已处理 —— 存量命中会被静默吞掉"
+
+# 这行提示绝不能挤爆 K1 的 2 KB 预算：规则名太多时必须退化成只报数量
+WB=$(mktemp -d); mkdir -p "$WB/.ratchet"; cp "$TMP/worst.json" "$WB/.ratchet/state.json"
+python3 -c "
+import json
+with open('$WB/.ratchet/hits.jsonl','w') as f:
+    for i in range(20):
+        f.write(json.dumps({'rule':f'some-very-long-rule-name-{i:02d}','decision':'ask',
+                            'at':'2026-07-13T00:00:00+00:00'})+chr(10))"
+n=$($BIN/ratchet-brief --state "$WB/.ratchet/state.json" | wc -c | tr -d ' ')
+[ "$n" -le 2048 ] && ok "最坏 state + 20 种未处理命中仍 ${n} B ≤ 2048 B（K1 未被提示挤爆）" \
+  || bad "提示挤爆了 K1 预算：${n} B > 2048 B"
+rm -r "$WB"
+
+# init 必须把运行时数据挡在版本库外。
+# 溯源：ratchet 自己的 .gitignore 早写明 hits.jsonl「切分支时挡路（真踩过：checkout
+# 直接 Aborting）」，却没把这个护栏装给用户工程 —— 于是用它的项目照样提交了 hits.jsonl。
+# 分界线：个人运行时（state/hits/log/archive）挡住；团队资产（rules/constitution/config）放行。
+GI=$(mktemp -d); git -C "$GI" init -q
+$BIN/ratchet-init --preset standard --root "$GI" >/dev/null 2>&1
+for f in .ratchet/state.json .ratchet/hits.jsonl .ratchet/log/x.md .ratchet/archive/y.md; do
+  git -C "$GI" check-ignore -q "$f" || bad "init 未挡住运行时数据 $f"
+done
+ok "init 把运行时数据挡在版本库外（state/hits/log/archive）"
+for f in .ratchet/rules/r.md .ratchet/constitution.md .ratchet/config.json; do
+  git -C "$GI" check-ignore -q "$f" && bad "init 误挡团队资产 $f —— rules/ 共享才有复利"
+done
+ok "init 放行团队资产（rules/ constitution.md config.json）"
+
+# 幂等：重跑不得重复追加
+$BIN/ratchet-init --preset standard --root "$GI" --force >/dev/null 2>&1
+[ "$(grep -c 'hits.jsonl' "$GI/.gitignore")" = "1" ] && ok "init 重跑不重复追加 .gitignore" \
+  || bad "init 重复追加了 .gitignore 条目"
+
+# 非 git 仓库不该凭空生成 .gitignore（那是噪声）
+NG=$(mktemp -d)
+$BIN/ratchet-init --preset standard --root "$NG" >/dev/null 2>&1
+[ -f "$NG/.gitignore" ] && bad "非 git 仓库不该生成 .gitignore" \
+  || ok "非 git 仓库不留 .gitignore"
 
 # 回归 · 热区 = 真正会进上下文的东西，不是「所有机制文件」。
 # .ratchet/constitution.md 不进上下文（AI 读 CLAUDE.md → @AGENTS.md，正文已在 AGENTS.md 里），

@@ -103,6 +103,10 @@
       "description": "会话计数。由 SessionEnd hook 自动维护，不手工改。",
       "properties": {
         "last": { "type": "integer", "minimum": 0, "description": "最近一次 session 编号" },
+        "id": {
+          "type": "string",
+          "description": "最近一次会话的 session_id。用来区分『新会话』与『同一会话再次触发 SessionEnd』（resume/clear）。没有它，计数器只会闷头 last+1：resume 白吃一个编号，日志里就留下空洞。"
+        },
         "last_date": { "type": "string", "format": "date" },
         "log_written": {
           "type": "boolean",

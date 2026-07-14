@@ -45,6 +45,45 @@ def load_hits(root: str) -> list[dict]:
     return out
 
 
+def ack_hits(root: str, rules: list[str], all_: bool) -> int:
+    """把命中标记为「已棘轮化 / 已驳回」，让起手简报的提示消失。
+
+    棘轮只进不退是熵增引擎 —— 提示只增不减同样是。起手简报顶出「N 条命中未棘轮化」
+    之后，必须有一条路让它消失：要么转化成规则，要么看过后判定不值得。
+    没有这条退路，提示会永远挂着，然后被学会无视 —— 一个被无视的提示比没有更糟，
+    它照样吃掉注意力预算，却不产生任何约束。
+    """
+    p = os.path.join(root, ".ratchet", "hits.jsonl")
+    if not os.path.isfile(p):
+        print("没有 hits.jsonl —— 还没有任何 guard 命中。")
+        return 0
+
+    lines, n = [], 0
+    with open(p, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                h = json.loads(line)
+            except json.JSONDecodeError:
+                lines.append(line)  # 坏行原样留着，不吞用户数据
+                continue
+            if h.get("ratcheted") is not True and (all_ or h.get("rule") in rules):
+                h["ratcheted"] = True
+                n += 1
+            lines.append(json.dumps(h, ensure_ascii=False))
+
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + ("\n" if lines else ""))
+
+    target = "全部" if all_ else "、".join(rules)
+    print(f"✅ 已标记 {n} 条命中为已处理（{target}）。起手简报不再提示它们。")
+    if n:
+        print("   注意：这只是让提示闭嘴。真正的棘轮是写出校验器 —— 别把 --ack 当成消音器用。")
+    return 0
+
+
 def known_rules() -> dict:
     try:
         r = subprocess.run([os.path.join(HERE, "ratchet-guard"), "--list-rules"],
@@ -67,12 +106,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--root", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     ap.add_argument("--stale-days", type=int, default=STALE_DAYS)
+    ap.add_argument("--ack", action="append", metavar="RULE",
+                    help="把该规则的命中标记为已处理（已转化成校验器，或看过后判定不值得）")
+    ap.add_argument("--ack-all", action="store_true", help="把所有未处理命中标记为已处理")
     a = ap.parse_args()
     root = a.root
 
     if not os.path.isdir(os.path.join(root, ".ratchet")):
         print("未初始化（没有 .ratchet/）。先跑 /ratchet:init", file=sys.stderr)
         return 1
+
+    if a.ack or a.ack_all:
+        return ack_hits(root, a.ack or [], a.ack_all)
 
     hits = load_hits(root)
     rules = known_rules()
