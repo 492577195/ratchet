@@ -14,7 +14,7 @@ ratchet-state — 校验 .ratchet/state.json 是否符合 schema。
 用法:
   ratchet-state                    # 校验 <project>/.ratchet/state.json
   ratchet-state --state PATH
-  ratchet-state --hook             # PostToolUse 模式：读 stdin，只在改了 state.json 时校验
+  ratchet-state --hook             # PostToolUse 模式：读 stdin 的 cwd，校验本项目 state.json（存在才校验）
 退出码:
   0 合法 / 1 非法 / 2 文件问题
 """
@@ -128,10 +128,20 @@ def main() -> int:
             payload = json.load(sys.stdin)
         except Exception:
             return emit_hook([])
-        fp = (payload.get("tool_input") or {}).get("file_path", "")
-        if not fp.endswith(os.path.join(".ratchet", "state.json")):
-            return emit_hook([])  # 改的不是 state.json，无事
-        path = fp
+        # 平台无关：不看 tool_input 的形状去猜「改的是不是 state.json」。
+        # Claude Code 的 Write/Edit 把路径放在 tool_input.file_path；
+        # Codex 的 apply_patch 把路径埋在 patch 文本里，tool_input 只有
+        # {"command": "*** Begin Patch\n*** Update File: <相对路径>\n..."}，
+        # 没有 file_path 键。改用双方都提供的 cwd 直接定位本项目的 state.json，
+        # 存在就校验 —— CC / Codex / 以后任何工具一视同仁。
+        # 溯源：首版靠 tool_input.file_path，在 Codex apply_patch 下恒为空，
+        # 于是每次都误判成「没动 state.json」而静默放行 —— 这道门禁在 Codex
+        # 侧从未拒绝过任何东西。实测 payload 确认 cwd 存在且为项目根。
+        root = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        sp = os.path.join(root, ".ratchet", "state.json")
+        if not os.path.isfile(sp):
+            return emit_hook([])  # 本项目没有 state.json，无事
+        path = sp
 
     if not path:
         root = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()

@@ -310,6 +310,33 @@ print(d["permissionDecision"] if d else "allow")')
 [ "$got" = "allow" ] && ok "allow  ← 未声明只读区时 config.json 可正常编辑" \
   || bad "无只读区的项目里 config.json 被锁死 —— 那就没人配得了它"
 
+# ── Codex apply_patch：与 CC 的 payload 形状不同，guard 曾两头都错 ──────
+# apply_patch 没有 tool_input.file_path，路径埋在补丁头里，正文也不是 shell 命令。
+# 溯源（实测）：
+#   ② 过拦 —— extract_command 把补丁正文当命令扫，往文件加一行含 rm -rf 字样的补丁被误 deny
+#   ③ 欠拦 —— 只读区只认 file_path 与 Bash 写命令，apply_patch 两者都不是 → 改判据一路畅通
+# 修法：is_apply_patch 让危险扫描跳过补丁正文（②）；check_readonly 按补丁目标路径拦（③）。
+PR() { ro_cmd "$(printf '%b' "$1")"; }   # %b 展开 \n，构造多行补丁
+
+# ③：apply_patch 改判据（路径内嵌补丁头）→ 必须 deny
+ro_expect deny apply_patch \
+  "$(PR "*** Begin Patch\n*** Update File: $RO/cases/truth.py\n@@\n-assert x == 1\n+assert True\n*** End Patch")" \
+  "apply_patch 改判据（只读区，路径埋在补丁里）"
+# ③·自封：apply_patch 也不许删掉声明了只读区的 config.json
+ro_expect deny apply_patch \
+  "$(PR "*** Begin Patch\n*** Delete File: $RP/.ratchet/config.json\n*** End Patch")" \
+  "apply_patch 删 config（不许经 apply_patch 解除只读区）"
+# ②：往普通文件加一行"看着危险"的文本 → 补丁不执行任何东西，必须放行
+ro_expect allow apply_patch \
+  "$(PR "*** Begin Patch\n*** Update File: $RP/deploy.sh\n@@\n-echo done\n+rm -rf ./build\n*** End Patch")" \
+  "apply_patch 往普通文件加含危险字样的一行 → 放行（补丁正文不是命令）"
+# 基线：apply_patch 改工作区普通文件 → 放行
+ro_expect allow apply_patch \
+  "$(PR "*** Begin Patch\n*** Update File: $RP/src/app.py\n@@\n-x\n+y\n*** End Patch")" \
+  "apply_patch 改工作区普通文件 → 放行"
+# 真·Bash 危险动作仍照拦（别为了修 apply_patch 把核心门禁放松了）
+ro_expect deny Bash "$(ro_cmd "rm -rf /tmp/whatever")" "真 Bash rm -rf 仍 deny（核心门禁不受影响）"
+
 # hook 输出必须是干净的 JSON —— 任何 warning/噪声混进流里都会污染平台解析
 out=$(printf '{"tool_name":"Bash","tool_input":{"command":"npm install ghostpkg"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard 2>&1)
 echo "$out" | grep -qi "warning\|traceback" && bad "guard 输出混入噪声" "$out" || ok "guard 输出干净无噪声"
@@ -545,7 +572,7 @@ echo "STATE·HOOK · 输出协议（判得对，还得让平台听得见）"
 # 测试必须走这条通路，不能拿 --state 抄近路 —— 否则测的就不是平台实际会跑的那段代码。
 # 本仓 .ratchet/state.json 已被移出版本库（运行时数据），所以测试自包含一个合法模板。
 HKD="$TMP/hk/.ratchet"; mkdir -p "$HKD"; HK="$HKD/state.json"
-GOOD="$TMP/hk/.ratchet/state-good.json"
+GOODD="$TMP/hkgood/.ratchet"; mkdir -p "$GOODD"; GOOD="$GOODD/state.json"
 python3 -c "
 import json
 d = {
@@ -554,11 +581,15 @@ d = {
   'session': {'last': 1, 'last_date': '2026-07-15', 'log_written': True},
   'updated_at': '2026-07-15T09:00:00Z'
 }
-json.dump(d, open('$GOOD', 'w'), ensure_ascii=False)
-d['current']['task'] = '超' * 60          # 60 字 > maxLength 50
-json.dump(d, open('$HK', 'w'), ensure_ascii=False)"
-hookpay() { printf '{"tool_name":"Edit","tool_input":{"file_path":"%s"},"cwd":"%s"}' "$1" "$TMP/hk"; }
-hookout=$(hookpay "$HK" | $BIN/ratchet-state --hook 2>/dev/null); hookrc=$?
+json.dump(d, open('$GOOD', 'w'), ensure_ascii=False)   # 合法：独立项目根 hkgood
+d['current']['task'] = '超' * 60                         # 60 字 > maxLength 50
+json.dump(d, open('$HK', 'w'), ensure_ascii=False)"      # 非法：项目根 hk
+# 校验通路一律从 payload.cwd 定位 <cwd>/.ratchet/state.json，不看 tool_input 形状。
+# cc_pay：Claude Code 形状（Edit + tool_input.file_path）
+cc_pay()    { printf '{"tool_name":"Edit","tool_input":{"file_path":"%s/.ratchet/state.json"},"cwd":"%s"}' "$1" "$1"; }
+# codex_pay：Codex 形状（apply_patch + tool_input.command 是 patch 文本，无 file_path 键）
+codex_pay() { printf '{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\\n*** Update File: foo.txt\\n@@\\n-hello\\n+goodbye\\n*** End Patch"},"cwd":"%s"}' "$1"; }
+hookout=$(cc_pay "$TMP/hk" | $BIN/ratchet-state --hook 2>/dev/null); hookrc=$?
 
 echo "$hookout" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("decision")=="block" and d.get("reason") else 1)' \
   && ok "非法 state → 顶层 decision:block + reason（PostToolUse 协议）" \
@@ -571,9 +602,25 @@ echo "$hookout" | grep -q "permissionDecision" \
 [ "$hookrc" -eq 0 ] && ok "阻断时退出码仍为 0（决策走 JSON，非退出码）" \
   || bad "阻断时退出码非 0 —— 会被平台误判为 hook 自身故障"
 
-hookpay "$GOOD" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decision" \
+cc_pay "$TMP/hkgood" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decision" \
   && bad "合法 state 竟然也阻断 —— 误伤会让用户直接关掉门禁" \
   || ok "合法 state 静默放行"
+
+# ── Codex apply_patch 回归：payload 无 file_path，路径埋在 patch 文本里 ──
+# 溯源：ratchet 靠 tool_input.file_path 判「改的是不是 state.json」，而 Codex 的
+# apply_patch 根本没有这个键 → fp 恒空 → 每次误判「没动 state」→ 静默放行，
+# 这道门禁在 Codex 侧从未拒绝过任何东西。（v0.1.8 只修了 hooks.json 位置让 Pre 生效，
+# Post 仍在空转。）实测 payload 证实：tool_input 只有 {"command":"*** Begin Patch..."}，cwd 为项目根。
+# 新逻辑改用 cwd 定位、与 tool_input 形状解耦：哪怕 apply_patch 改的是 foo.txt，
+# 只要本项目 state.json 非法，就得在这一跳被顶出来。
+cxout=$(codex_pay "$TMP/hk" | $BIN/ratchet-state --hook 2>/dev/null)
+echo "$cxout" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("decision")=="block" else 1)' \
+  && ok "Codex apply_patch（无 file_path）下非法 state 仍被阻断 —— 绕过已堵" \
+  || bad "Codex apply_patch 绕过 state 校验（回归）" "$cxout"
+
+codex_pay "$TMP/hkgood" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decision" \
+  && bad "Codex 形状下合法 state 被误伤" \
+  || ok "Codex apply_patch + 合法 state → 静默放行"
 
 # ─────────────────────────────────────────────────────────────
 echo

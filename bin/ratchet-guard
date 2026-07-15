@@ -212,12 +212,50 @@ FALLBACK_NOTE = {
 }
 
 
+def is_apply_patch(payload: dict) -> bool:
+    """这条调用是不是 Codex 的 apply_patch。
+
+    apply_patch 写文件、不执行 shell，其 tool_input.command 是**补丁正文**而非命令。
+    优先看 tool_name，兜底看正文是否以 `*** Begin Patch` 开头（防平台改了工具名）。
+    """
+    if payload.get("tool_name") == "apply_patch":
+        return True
+    ti = payload.get("tool_input")
+    if isinstance(ti, dict):
+        c = ti.get("command")
+        if isinstance(c, str) and c.lstrip().startswith("*** Begin Patch"):
+            return True
+    return False
+
+
+# apply_patch 把目标路径埋在补丁头里（头字面量 *** Add/Update/Delete File: 与
+# *** Move to: 均从 codex 二进制实证）。这是它唯一的路径来源 —— 没有 file_path 键。
+_PATCH_TARGET = re.compile(r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$", re.M)
+_PATCH_MOVE = re.compile(r"^\*\*\* Move to:\s*(.+?)\s*$", re.M)
+
+
+def apply_patch_paths(payload: dict) -> list[str]:
+    """apply_patch 补丁要写 / 删 / 移到的相对路径（相对 cwd）。"""
+    ti = payload.get("tool_input") or {}
+    patch = ti.get("command", "") if isinstance(ti, dict) else ""
+    if not isinstance(patch, str):
+        return []
+    hits = _PATCH_TARGET.findall(patch) + _PATCH_MOVE.findall(patch)
+    return [p for p in (s.strip().strip("\"'") for s in hits) if p]
+
+
 def extract_command(payload: dict) -> str:
     """从 payload 里尽力挖出命令文本。
 
     不依赖工具名 —— CC 的工具叫 Bash，Codex 走 shell exec，字段也可能不同。
     宁可多扫几个字段，也不要因为平台改了个键名就悄悄失效。
     """
+    # apply_patch 写文件、不执行 shell —— 它的 tool_input.command 是补丁正文，不是命令。
+    # 首版把补丁正文喂进危险模式扫描，于是「往文件加一行含 rm -rf 字样」的补丁被误判成
+    # 「要执行 rm -rf」而 deny（实测复现）。补丁的正确防线是只读区（见 check_readonly），
+    # 不是 shell 危险扫描 —— 所以这里直接返回空，让危险扫描 / Slopsquatting 一律跳过它。
+    if is_apply_patch(payload):
+        return ""
     ti = payload.get("tool_input") or payload.get("input") or {}
     if isinstance(ti, str):
         return ti
@@ -348,6 +386,16 @@ def check_readonly(payload: dict, root: str) -> str | None:
                 return (f"{os.path.basename(hit)} 是只读区，不能改。\n"
                         f"它是判据（或受保护的配置）—— 判据被改动，验证就失去意义。\n"
                         f"该改的是被测代码，不是尺子。")
+
+    # 一·B、apply_patch —— Codex 的文件编辑通路。路径埋在补丁头里
+    # （*** Add/Update/Delete File: / *** Move to:），既没有 file_path 键、
+    # 也不是 shell 写命令，前面的 WRITE_TOOLS 分支和后面的 Bash 分支都漏。
+    # 不补这条，Codex 下 apply_patch 改判据 / 改只读配置一路畅通（同 state 校验那个欠拦）。
+    for tgt in apply_patch_paths(payload):
+        hit = _under(os.path.join(root, tgt), roots)
+        if hit:
+            return (f"{os.path.basename(hit)} 是只读区，不能改（apply_patch 目标：{tgt}）。\n"
+                    f"判据被改动，验证就失去意义。该改的是被测代码，不是尺子。")
 
     # 二、Bash —— 只看**写入目标**，读和执行一律放行
     cmd = extract_command(payload)

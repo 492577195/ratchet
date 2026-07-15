@@ -283,6 +283,7 @@ schema/state.schema.json
 
 - **顶层只能有 `description` 和 `hooks`。** 出现 `$schema` 或 `_comment`，Codex 会拒绝整个文件并**静默丢弃全部 hook**（这是个真实发生过的线上故障 ⚠️）
 - **`matcher` 一律留空。** CC 的工具叫 `Bash`，Codex 走 shell exec —— 写死工具名会在 Codex 上悄悄失效。粗筛交给 matcher，真正的过滤在脚本里做
+- **payload 形状因平台/工具而异，别写死 `tool_input.file_path`。** CC 的 Write/Edit 把路径放在 `tool_input.file_path`；Codex 的 apply_patch 把路径埋在 patch 文本里（`*** Update File:`），`tool_input` 只有 `command`、没有 `file_path`。要判「改了哪个文件」，用两平台都提供的 `cwd` 从项目根定位，别赌某一平台的字段。实测线上故障 ⚠️：state 校验（PostToolUse）在 Codex 从未生效（欠拦）、guard（PreToolUse）把补丁正文当命令扫而误拦（过拦）
 - Codex 注入 `CLAUDE_PLUGIN_ROOT` 兼容别名，所以 hook 脚本零修改复用
 - Codex 无 subagent 概念 —— 需要并行子代理的能力在 Codex 侧退化为串行
 
