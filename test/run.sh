@@ -322,16 +322,28 @@ printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"%s"}' "$G
 echo
 echo "HOOKS · 双平台配置与协议"
 # ─────────────────────────────────────────────────────────────
+# Codex 自动发现插件根目录的 hooks.json（Figma/ReplayIO 等官方插件均如此），
+# 不声明在 plugin.json 里；Claude Code 则通过 plugin.json 的 hooks 字段显式引用。
+# 这是 ratchet 在 Codex 下曾经失效的根因：文件放在 hooks/hooks.json，Codex 看不到。
+[ -f hooks.json ] && ok "hooks.json 位于插件根目录（Codex 可发现）" \
+  || bad "hooks.json 不在根目录 —— Codex 不会加载它"
+codex_hooks=$(python3 -c "import json;print(json.load(open('.codex-plugin/plugin.json')).get('hooks',''))")
+[ "$codex_hooks" = "./hooks.json" ] && ok ".codex-plugin/plugin.json 声明 hooks" \
+  || bad ".codex-plugin/plugin.json 未指向 hooks.json" "$codex_hooks"
+claude_hooks=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json')).get('hooks',''))")
+[ "$claude_hooks" = "./hooks.json" ] && ok ".claude-plugin/plugin.json 指向根目录 hooks.json" \
+  || bad ".claude-plugin/plugin.json hooks 路径错误" "$claude_hooks"
+
 # Codex 的解析器会因任何未知顶层字段拒绝整份 hooks.json 并静默丢弃全部 hook。
 # 这正是 mppm 线上的真实故障：顶层的 $schema/_comment 让它在 Codex 上全员失效。
-top=$(python3 -c "import json;print(','.join(sorted(json.load(open('hooks/hooks.json')).keys())))")
+top=$(python3 -c "import json;print(','.join(sorted(json.load(open('hooks.json')).keys())))")
 [ "$top" = "description,hooks" ] && ok "hooks.json 顶层仅 description/hooks（Codex 可解析）" \
   || bad "hooks.json 顶层含 Codex 不接受的字段" "$top"
 
 # matcher 必须留空：CC 的工具叫 Bash，Codex 走 shell exec，写死工具名会在 Codex 静默失效
 nonempty=$(python3 -c "
 import json
-d=json.load(open('hooks/hooks.json'))['hooks']
+d=json.load(open('hooks.json'))['hooks']
 print(sum(1 for evs in d.values() for e in evs if e.get('matcher')))")
 [ "$nonempty" = "0" ] && ok "matcher 全部留空（跨平台安全，过滤交给脚本）" \
   || bad "有 $nonempty 处写死了 matcher —— 会在 Codex 上失效"
@@ -339,7 +351,7 @@ print(sum(1 for evs in d.values() for e in evs if e.get('matcher')))")
 # 门禁必须同步执行，异步的门禁拦不住任何东西
 asy=$(python3 -c "
 import json
-d=json.load(open('hooks/hooks.json'))['hooks']
+d=json.load(open('hooks.json'))['hooks']
 print(sum(1 for ev in ('PreToolUse','PostToolUse') for e in d.get(ev,[])
           for h in e['hooks'] if h.get('async')))")
 [ "$asy" = "0" ] && ok "Pre/PostToolUse 均为同步（async 的门禁形同虚设）" || bad "有异步门禁"
@@ -531,10 +543,18 @@ echo "STATE·HOOK · 输出协议（判得对，还得让平台听得见）"
 #   PostToolUse → 顶层 decision: "block" + reason
 # --hook 走的是真实 hook 通路：payload 从 stdin 进，file_path 必须落在 .ratchet/state.json。
 # 测试必须走这条通路，不能拿 --state 抄近路 —— 否则测的就不是平台实际会跑的那段代码。
+# 本仓 .ratchet/state.json 已被移出版本库（运行时数据），所以测试自包含一个合法模板。
 HKD="$TMP/hk/.ratchet"; mkdir -p "$HKD"; HK="$HKD/state.json"
+GOOD="$TMP/hk/.ratchet/state-good.json"
 python3 -c "
 import json
-d = json.load(open('.ratchet/state.json'))
+d = {
+  'schema_version': 1, 'preset': 'standard',
+  'current': {'task': 'ok', 'next': 'ok'},
+  'session': {'last': 1, 'last_date': '2026-07-15', 'log_written': True},
+  'updated_at': '2026-07-15T09:00:00Z'
+}
+json.dump(d, open('$GOOD', 'w'), ensure_ascii=False)
 d['current']['task'] = '超' * 60          # 60 字 > maxLength 50
 json.dump(d, open('$HK', 'w'), ensure_ascii=False)"
 hookpay() { printf '{"tool_name":"Edit","tool_input":{"file_path":"%s"},"cwd":"%s"}' "$1" "$TMP/hk"; }
@@ -551,7 +571,7 @@ echo "$hookout" | grep -q "permissionDecision" \
 [ "$hookrc" -eq 0 ] && ok "阻断时退出码仍为 0（决策走 JSON，非退出码）" \
   || bad "阻断时退出码非 0 —— 会被平台误判为 hook 自身故障"
 
-hookpay "$PWD/.ratchet/state.json" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decision" \
+hookpay "$GOOD" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decision" \
   && bad "合法 state 竟然也阻断 —— 误伤会让用户直接关掉门禁" \
   || ok "合法 state 静默放行"
 
