@@ -56,6 +56,7 @@
 | 收尾要记什么 | `ratchet-digest`（SessionEnd 自动落盘；你只需补「决策与教训」一段） |
 | 上下文用量 | statusLine 常显（不需要你估算和汇报） |
 | 状态文件是否合法 | `ratchet-state`（PostToolUse 校验） |
+| 失败有没有被转化 | `ratchet-brief`（起手顶出未棘轮化的 guard 命中，不靠你想起来） |
 
 **所以这份宪法很短。** 短不是因为纪律少了，而是因为能机器化的都已经不在文字里了。
 

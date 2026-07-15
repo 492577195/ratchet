@@ -2,8 +2,14 @@
 *.pyc
 __pycache__/
 
-# guard 的命中记录 —— 运行时数据，不该进版本库。
-# 它需要持久化在本地供 /ratchet:slim 做减法，但没有理由跟着代码走：
+# .ratchet/ 是**运行时目录**，不是产品。里面全是「这台机器上这个人」的工作留痕：
+# 状态、会话日志、guard 命中、归档。它们没有理由跟着代码走：
 #   · 每次会话都在变，切分支时挡路（真踩过：checkout 直接 Aborting）
-#   · 跟着走会让 clone 的人拿到**别人的**命中记录，污染自己的减法依据
-.ratchet/hits.jsonl
+#   · 每人一份才有意义 —— clone 的人拿到别人的命中记录，会污染自己 /ratchet:slim 的减法依据
+#   · ratchet 是插件，marketplace 会把整个仓库拉到每个用户机器上。提交这里 =
+#     把维护者的任务状态和会话日志分发给每一个安装者。（真发生过：
+#     ~/.claude/plugins/marketplaces/ratchet/.ratchet/state.json 里躺着维护者的开发状态。）
+#
+# 本仓库的工作纪律权威副本是 AGENTS.md，不是 .ratchet/constitution.md（后者是 init 的生成物）。
+# 想看规则长什么样：docs/example-rule.md。
+.ratchet/

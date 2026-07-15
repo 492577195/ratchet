@@ -269,7 +269,7 @@ bin/ratchet-context    上下文占比（statusLine）
 bin/ratchet-overhead   机制税审计 —— 给脚手架自己做体检
 bin/ratchet-audit      减法审计 —— 棘爪释放的数据来源
 lib/transcript.py      transcript 共享解析器
-hooks/hooks.json       双平台共用（一份两用）
+hooks.json             双平台共用（一份两用）
 skills/                init · handoff · ratchet · slim
 templates/constitution.md   纪律基线（硬上限 4 KB）
 schema/state.schema.json
@@ -279,7 +279,7 @@ schema/state.schema.json
 
 ## 跨平台
 
-一份 `hooks/hooks.json` 两个平台共用。实测得出的兼容规则：
+一份 `hooks.json` 两个平台共用，放在插件根目录以便 Codex 自动发现；Claude Code 通过 `.claude-plugin/plugin.json` 的 `hooks` 字段显式引用。实测得出的兼容规则：
 
 - **顶层只能有 `description` 和 `hooks`。** 出现 `$schema` 或 `_comment`，Codex 会拒绝整个文件并**静默丢弃全部 hook**（这是个真实发生过的线上故障 ⚠️）
 - **`matcher` 一律留空。** CC 的工具叫 `Bash`，Codex 走 shell exec —— 写死工具名会在 Codex 上悄悄失效。粗筛交给 matcher，真正的过滤在脚本里做

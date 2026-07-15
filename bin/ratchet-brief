@@ -25,6 +25,9 @@ import sys
 BUDGET = 2048  # K1: 起手注入 ≤ 2 KB
 
 
+HITS_LINE_MAX = 150  # 这一行的字节硬上限。挤爆 2 KB 预算的提示不如不提示。
+
+
 def find_state(explicit=None):
     if explicit:
         return explicit
@@ -32,7 +35,47 @@ def find_state(explicit=None):
     return os.path.join(d, ".ratchet", "state.json")
 
 
-def render(st):
+def pending_hits(state_path):
+    """未棘轮化的 guard 命中：规则名 → 次数。
+
+    棘轮零转化的根因是它缺一个触发器：留痕、门禁、状态校验全是 hook 自动跑的，
+    唯独「失败 → 永久约束」这一步指望人想起来 —— 而失败随着会话上下文一起蒸发。
+    guard 每次命中都写了 hits.jsonl，机器写的、零歧义，只是从来没人消费。
+    这里就是那个消费端：起手时把它顶到眼前。
+
+    `ratcheted` 缺失即视为「未处理」—— 老的 hits.jsonl 没这个字段，必须向后兼容。
+    """
+    p = os.path.join(os.path.dirname(state_path), "hits.jsonl")
+    cnt = {}
+    try:
+        with open(p, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    h = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if h.get("ratcheted") is True:
+                    continue
+                r = h.get("rule") or "?"
+                cnt[r] = cnt.get(r, 0) + 1
+    except OSError:
+        pass
+    return cnt
+
+
+def hits_line(cnt):
+    """渲染那一行提示。放不下就退化成只报数量 —— 但绝不放弃提示。"""
+    if not cnt:
+        return None
+    total = sum(cnt.values())
+    names = "·".join(r for r, _ in sorted(cnt.items(), key=lambda kv: -kv[1]))
+    line = f"⚙️ {total} 条 guard 命中未棘轮化（{names}）→ /ratchet:ratchet 转化，或驳回"
+    if len(line.encode("utf-8")) > HITS_LINE_MAX:
+        line = f"⚙️ {total} 条 guard 命中未棘轮化 → /ratchet:ratchet 转化，或驳回"
+    return line
+
+
+def render(st, state_path=None):
     L = []
     cur = st.get("current", {})
     it, stage = cur.get("iteration"), cur.get("stage")
@@ -68,9 +111,16 @@ def render(st):
             L.append(f"- {d['decision']} —— {d['why']}")
 
     sess = st.get("session") or {}
+    tail = []
     if sess.get("log_written") is False:
+        tail.append(f"⚠️ 上次会话（s-{sess.get('last', '?')}）的日志未写，先补写再开新工作。")
+    if state_path:
+        hl = hits_line(pending_hits(state_path))
+        if hl:
+            tail.append(hl)
+    if tail:
         L.append("")
-        L.append(f"⚠️ 上次会话（s-{sess.get('last', '?')}）的日志未写，先补写再开新工作。")
+        L.extend(tail)
 
     return "\n".join(L) + "\n"
 
@@ -118,7 +168,7 @@ def main():
         print(f"ratchet: state.json 非法 JSON — {e}", file=sys.stderr)
         return 1
 
-    out = render(st)
+    out = render(st, path)
     n = len(out.encode("utf-8"))
 
     if n > a.budget:

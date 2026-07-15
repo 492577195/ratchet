@@ -110,6 +110,22 @@ def render(d: transcript.Digest, session: int | None, root: str) -> str:
     return "\n".join(L)
 
 
+def session_id(payload: dict) -> str:
+    """本次会话的唯一标识。
+
+    两条腿走路，任一可用即可 —— 不赌单一字段：
+      1. payload.session_id：官方文档列为通用字段，但 SessionEnd 的完整 schema
+         文档没给全，属未实测来源。
+      2. transcript 文件名：实测过 —— basename 与 transcript 内的 sessionId 完全一致。
+         digest 本来就吃 transcript_path，这个来源不额外依赖任何东西。
+    """
+    sid = str(payload.get("session_id") or "").strip()
+    if sid:
+        return sid
+    tp = payload.get("transcript_path") or ""
+    return os.path.splitext(os.path.basename(tp))[0] if tp else ""
+
+
 def run_hook(payload: dict) -> int:
     """SessionEnd：把机械事实落盘，并标记『决策段待补』。
 
@@ -136,18 +152,42 @@ def run_hook(payload: dict) -> int:
         return 0  # 空会话不留痕
 
     sess = st.setdefault("session", {})
-    n = int(sess.get("last") or 0) + 1
+    sid = session_id(payload)
+    resumed = bool(sid) and sid == sess.get("id")
+
     logdir = os.path.join(rd, "log")
     os.makedirs(logdir, exist_ok=True)
-    fp = os.path.join(logdir, f"{datetime.date.today().isoformat()}-s{n}.md")
+    today = datetime.date.today().isoformat()
 
-    if not os.path.exists(fp):  # 幂等：resume 不覆盖
-        with open(fp, "w", encoding="utf-8") as fh:
-            fh.write(render(d, n, root))
+    # 首版的 bug：n 无脑取 last+1，然后 `if not exists(fp)` 静默跳过写入，
+    # 却照样把 last 递增、照样报告「已生成日志草稿」。两个后果：
+    #   · 谎报 —— 什么都没写，却说写了（违反纪律三：诚实）
+    #   · 同一个会话被 resume，就白吃一个编号，日志序列里留下空洞
+    # 根因是这个计数器不知道「会话」是什么，只会做加法。所以给它一个身份。
+    if resumed:
+        # 同一会话再次收尾（resume / clear）：不吃新编号。
+        n = int(sess.get("last") or 0)
+        fp = os.path.join(logdir, f"{today}-s{n}.md")
+        wrote = not os.path.exists(fp)
+        if wrote:  # 上次没写成（比如那次是空会话），补上
+            open(fp, "w", encoding="utf-8").write(render(d, n, root))
+    else:
+        # 新会话：编号本不该撞。撞了说明 state 与 log 不同步（state 被手工改过？）——
+        # 顺延到下一个空位，绝不覆盖别人的日志，也绝不静默跳过。
+        n = int(sess.get("last") or 0) + 1
+        fp = os.path.join(logdir, f"{today}-s{n}.md")
+        while os.path.exists(fp):
+            n += 1
+            fp = os.path.join(logdir, f"{today}-s{n}.md")
+        open(fp, "w", encoding="utf-8").write(render(d, n, root))
+        wrote = True
 
     sess["last"] = n
-    sess["last_date"] = datetime.date.today().isoformat()
-    sess["log_written"] = False  # 决策段还没写 —— 下次起手简报会顶着 ⚠️ 提醒
+    if sid:
+        sess["id"] = sid
+    sess["last_date"] = today
+    if not resumed:
+        sess["log_written"] = False  # 决策段还没写 —— 下次起手简报会顶着 ⚠️ 提醒
     st["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     with open(state_p, "w", encoding="utf-8") as fh:
         json.dump(st, fh, ensure_ascii=False, indent=2)
@@ -161,10 +201,13 @@ def run_hook(payload: dict) -> int:
     # 日志其实落盘了（副作用在这行之前就发生了），但每次收尾都往用户终端喷一行红字。
     # 这是本项目第二次栽在「凭印象写 hook 输出协议」上（第一次是 PostToolUse 误用
     # permissionDecision）—— 所以现在每个 hook 事件的输出格式都有测试钉死。
-    json.dump(
-        {"systemMessage": f"[ratchet] 已生成 s-{n} 日志草稿：{os.path.relpath(fp, root)}（决策段待补）"},
-        sys.stdout, ensure_ascii=False,
-    )
+    #
+    # 只报告真实发生的事。文件没写就不许说「已生成」—— 那是把留痕的假象卖给用户，
+    # 而留痕是 brief 和 slim 共同的地基。
+    rp = os.path.relpath(fp, root)
+    msg = (f"[ratchet] 已生成 s-{n} 日志草稿：{rp}（决策段待补）" if wrote
+           else f"[ratchet] s-{n} 日志草稿已存在，未覆盖：{rp}")
+    json.dump({"systemMessage": msg}, sys.stdout, ensure_ascii=False)
     print()
     return 0
 

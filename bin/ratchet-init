@@ -51,6 +51,53 @@ def die(msg: str) -> int:
     return 1
 
 
+# .ratchet/ 里混着两类东西，分界线就是「这份数据换个人还成立吗」：
+#
+#   个人运行时 —— 每人一份才有意义，提交必冲突：
+#     state.json   你此刻在做什么（队友的进度不是你的进度）
+#     hits.jsonl   guard 在你机器上拦了什么（/ratchet:slim 的减法依据，
+#                  掺进别人的命中就失真了）
+#     log/         你的会话留痕
+#     archive/     归档
+#
+#   团队资产 —— 共享才有复利，照常提交：
+#     rules/           棘轮成果。一个人踩的坑，全队不必再踩
+#     constitution.md  工作纪律
+#     config.json      档位配置
+#
+# 不写这个函数的代价是真实的：ratchet 自己的 .gitignore 早就写明 hits.jsonl
+# "切分支时挡路（真踩过：checkout 直接 Aborting）"，却没把这个护栏装给用户工程 ——
+# 于是用它的项目照样把 hits.jsonl 提交了进去。自己踩过的坑，要变成所有人的物理约束。
+GITIGNORE_BLOCK = """
+# ── ratchet 运行时数据（由 ratchet-init 写入）────────────────────
+# 个人的，不是团队的：换个人就不成立，提交必冲突。
+# rules/ constitution.md config.json 不在此列 —— 那些是团队资产，照常提交。
+.ratchet/state.json
+.ratchet/hits.jsonl
+.ratchet/log/
+.ratchet/archive/
+"""
+
+
+def ensure_gitignore(root: str) -> bool:
+    """把运行时数据挡在版本库外。幂等；非 git 仓库不留痕。
+
+    返回 True 表示这次真的写了。
+    """
+    if not os.path.exists(os.path.join(root, ".git")):
+        return False  # 不是 git 仓库，凭空生成 .gitignore 是噪声
+
+    gi = os.path.join(root, ".gitignore")
+    cur = open(gi, encoding="utf-8").read() if os.path.isfile(gi) else ""
+    if ".ratchet/hits.jsonl" in cur:
+        return False  # 已有，不重复追加
+
+    sep = "" if (not cur or cur.endswith("\n")) else "\n"
+    with open(gi, "a", encoding="utf-8") as fh:
+        fh.write(sep + GITIGNORE_BLOCK)
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--preset", choices=["standard", "complex"])
@@ -145,6 +192,9 @@ def main() -> int:
     elif "@AGENTS.md" not in open(claude_p, encoding="utf-8").read():
         print("ℹ️  CLAUDE.md 已存在但未导入 AGENTS.md。建议在开头加一行： @AGENTS.md")
 
+    # ── .gitignore：把运行时数据挡在版本库外 ────────────────
+    ignored = ensure_gitignore(root)
+
     print(f"✅ ratchet 已初始化（档位: {a.preset}）\n")
     print(f"  .ratchet/state.json      你的状态（唯一真源，永不被覆写）")
     print(f"  .ratchet/constitution.md 纪律基线（plugin 产物，upgrade 会更新）")
@@ -152,6 +202,9 @@ def main() -> int:
     print(f"  .ratchet/rules/          你的自定义规则（/ratchet 会往这里加）")
     print(f"  AGENTS.md                纪律真源（Codex 直接读）")
     print(f"  CLAUDE.md                薄壳，@ 导入 AGENTS.md")
+    if ignored:
+        print(f"  .gitignore               已挡住运行时数据（state/log/hits/archive）")
+        print(f"                           rules/ 与 constitution.md 照常提交 —— 那是团队资产")
     print(f"\n下一步：把 .ratchet/state.json 的 current.task / current.next 填上，"
           f"起手简报就会显示它们。")
     return 0
