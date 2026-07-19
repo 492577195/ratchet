@@ -422,17 +422,39 @@ n=$(python3 -c "import json;print(json.load(open('$PROJ/.ratchet/state.json'))['
 cnt=$(ls "$PROJ/.ratchet/log/" | wc -l | tr -d ' ')
 [ "$cnt" = "1" ] && ok "resume 不覆盖、不新增日志" || bad "resume 产生了 $cnt 份日志"
 
-# 新会话（不同 session_id）：必须递增，且绝不覆盖别人的日志
-printf '{"session_id":"S-2","transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
+# 新会话（不同 session_id + 新 transcript）：必须递增，且绝不覆盖别人的日志。
+# 注意：新会话必须配新 transcript —— 真实世界 sessionId 与 transcript 文件名 1:1。
+# 「同 transcript + 新 sid」这个形状只出现在手动 CLI digest 收尾后的 /clear，
+# 那是 s8→s9 型幽灵，由下方的指纹断言拦死，不算新会话。
+cp "$PROJ/t.jsonl" "$PROJ/u.jsonl"
+printf '{"session_id":"S-2","transcript_path":"%s/u.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
 n=$(python3 -c "import json;print(json.load(open('$PROJ/.ratchet/state.json'))['session']['last'])")
 [ "$n" = "5" ] && ok "新会话递增编号（s-5）" || bad "新会话未递增：last=${n}"
 [ -f "$PROJ/.ratchet/log/"*"-s5.md" ] 2>/dev/null && ok "新会话落了独立日志" || bad "新会话未落日志"
+
+# 幽灵断根 · 手动 CLI digest 收尾 + /clear（s8→s9 型，session_id 机制的盲区）
+# 溯源（s5/s7/s9 三犯的最后一型）：手动 digest 走 CLI 不写 state.id；/clear 的
+# hook 拿着同一条 transcript、sid 对不上 state.id → 旧版判「新会话」照样吃号、
+# 翻 log_written=false —— 下个会话空转排查「日志未写」。指纹不看 state 看产物。
+grep -q "transcript:t.jsonl" "$PROJ/.ratchet/log/"*-s4.md \
+  && ok "日志头部嵌入 transcript 指纹（盲区兜底的判据）" || bad "日志缺 transcript 指纹"
+python3 -c "
+import json;p='$PROJ/.ratchet/state.json';d=json.load(open(p))
+d['session']['id']='S-manual-unknown';d['session']['log_written']=True
+json.dump(d,open(p,'w'),ensure_ascii=False)"
+printf '{"session_id":"S-clear","transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
+cnt=$(ls "$PROJ/.ratchet/log/" | wc -l | tr -d ' ')
+gst=$(python3 -c "import json;s=json.load(open('$PROJ/.ratchet/state.json'))['session'];print(s['last'],s['log_written'])")
+[ "$cnt" = "2" ] && [ "$gst" = "5 True" ] \
+  && ok "sid 对不上但 transcript 已留痕 → 不吃号、不翻 false（s8→s9 型断根）" \
+  || bad "手动 digest 盲区幽灵复发：cnt=$cnt state=$gst（应 cnt=2 last=5 True）"
 
 # state 与 log 不同步（state 被手工改过）时，绝不覆盖已有日志 —— 顺延到空位
 python3 -c "
 import json;p='$PROJ/.ratchet/state.json';d=json.load(open(p))
 d['session']['last']=3;d['session']['id']='S-old';json.dump(d,open(p,'w'),ensure_ascii=False)"
-printf '{"session_id":"S-3","transcript_path":"%s/t.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
+cp "$PROJ/t.jsonl" "$PROJ/v.jsonl"
+printf '{"session_id":"S-3","transcript_path":"%s/v.jsonl","cwd":"%s"}' "$PROJ" "$PROJ" | $BIN/ratchet-digest --hook >/dev/null
 n=$(python3 -c "import json;print(json.load(open('$PROJ/.ratchet/state.json'))['session']['last'])")
 [ "$n" = "6" ] && ok "编号撞车时顺延到空位（不覆盖既有日志）" || bad "编号撞车未顺延：last=${n}（应为 6）"
 rm -r "$PROJ"
