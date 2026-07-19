@@ -64,10 +64,17 @@ def rel(p: str, root: str) -> str:
         return p
 
 
-def render(d: transcript.Digest, session: int | None, root: str) -> str:
+def render(d: transcript.Digest, session: int | None, root: str, tid: str = "") -> str:
     today = datetime.date.today().isoformat()
     sid = f"s-{session}" if session is not None else "s-?"
-    L = [f"# {sid} · {today}", ""]
+    L = [f"# {sid} · {today}"]
+    # transcript 指纹：session_id 机制的盲区兜底。手动 CLI digest 不写 state.id，
+    # 之后 /clear 触发的 hook 拿着同一条 transcript 却匹配不上 state.id，
+    # 会被判成「新会话」照样吃号（s8→s9 型幽灵）。指纹嵌进日志头部、与 state 无关，
+    # 手工流程破坏不了它。
+    if tid:
+        L.append(f"<!-- transcript:{tid} -->")
+    L.append("")
 
     L.append("## 做了什么（自动抽取，勿手改）")
     L.append("")
@@ -126,6 +133,27 @@ def session_id(payload: dict) -> str:
     return os.path.splitext(os.path.basename(tp))[0] if tp else ""
 
 
+def _find_by_transcript(logdir: str, tid: str) -> str:
+    """日志目录里已有这条 transcript 产物的日志吗？有则返回文件名。
+
+    只读每份日志的头部 —— 标记就在标题下一行，不必读全文件。
+    """
+    if not os.path.isdir(logdir):
+        return ""
+    mark = f"<!-- transcript:{tid} -->"
+    for fn in sorted(os.listdir(logdir)):
+        if not fn.endswith(".md"):
+            continue
+        try:
+            with open(os.path.join(logdir, fn), encoding="utf-8") as fh:
+                head = fh.read(4096)
+        except OSError:
+            continue
+        if mark in head:
+            return fn
+    return ""
+
+
 def run_hook(payload: dict) -> int:
     """SessionEnd：把机械事实落盘，并标记『决策段待补』。
 
@@ -156,6 +184,22 @@ def run_hook(payload: dict) -> int:
     resumed = bool(sid) and sid == sess.get("id")
 
     logdir = os.path.join(rd, "log")
+
+    # 指纹去重（仅拦「身份对不上」的重复）：resumed 管「同一会话再次收尾」，
+    # 但手动 CLI digest 不写 state.id —— /clear 的 hook 拿着同一条 transcript、
+    # sid 匹配不上，会被判成新会话照样吃号、翻 log_written=false（s8→s9 型幽灵，
+    # s5/s7/s9 三犯里的最后一型）。产物已物理存在的 transcript，绝不再产第二份。
+    tid = os.path.basename(payload.get("transcript_path", "") or "")
+    if not resumed and tid:
+        dup = _find_by_transcript(logdir, tid)
+        if dup:
+            json.dump(
+                {"systemMessage": f"[ratchet] 本 transcript 已留痕为 {dup}，跳过重复 digest"},
+                sys.stdout, ensure_ascii=False,
+            )
+            print()
+            return 0
+
     os.makedirs(logdir, exist_ok=True)
     today = datetime.date.today().isoformat()
 
@@ -170,7 +214,7 @@ def run_hook(payload: dict) -> int:
         fp = os.path.join(logdir, f"{today}-s{n}.md")
         wrote = not os.path.exists(fp)
         if wrote:  # 上次没写成（比如那次是空会话），补上
-            open(fp, "w", encoding="utf-8").write(render(d, n, root))
+            open(fp, "w", encoding="utf-8").write(render(d, n, root, tid))
     else:
         # 新会话：编号本不该撞。撞了说明 state 与 log 不同步（state 被手工改过？）——
         # 顺延到下一个空位，绝不覆盖别人的日志，也绝不静默跳过。
@@ -179,7 +223,7 @@ def run_hook(payload: dict) -> int:
         while os.path.exists(fp):
             n += 1
             fp = os.path.join(logdir, f"{today}-s{n}.md")
-        open(fp, "w", encoding="utf-8").write(render(d, n, root))
+        open(fp, "w", encoding="utf-8").write(render(d, n, root, tid))
         wrote = True
 
     sess["last"] = n
@@ -243,7 +287,7 @@ def main() -> int:
         return 1
 
     d = transcript.parse(path)
-    sys.stdout.write(render(d, a.session, a.root))
+    sys.stdout.write(render(d, a.session, a.root, os.path.basename(path)))
     return 0
 
 
