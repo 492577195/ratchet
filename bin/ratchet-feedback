@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+ratchet-feedback — 把真实项目里撞见的 ratchet 问题，打包成可消化的 issue。
+
+治什么病：ratchet 装在各个项目里跑，问题暴露在现场、修复在 ratchet 仓。
+没有这条管道时，finding 靠人手搬运（docs/finding-hits-无命令原文.md 就是
+人工搬回来的），上下文丢一半，还没有状态跟踪。
+
+分工（与 init 同一哲学：确定性工作归脚本，语义归模型）：
+  collect  机械采集环境事实 → JSON。模型不许手抄这些事实 —— 手抄就会每次编得不一样。
+  lint     脱敏 + 结构检查。密钥是 error，**不设 --force 豁免** —— 改完再跑一遍就是正路。
+  submit   唯一的网络层（薄），gh 全包办。**非交互** —— 「发给用户确认」是 skill 的
+           职责，脚本不再二次询问，职责单一是可测性的前提。
+
+platform 恒为 "unknown"，**脚本不猜平台**：CC/Codex 没有可靠的进程内判别事实，
+而平台是 bug 模板里最关键的分流字段。猜出来的关键数值比缺失更糟 ——
+由 skill 问用户，对齐 issue 模板的四个选项。
+
+用法:
+  ratchet-feedback collect [--root DIR] [--hits N]
+  ratchet-feedback lint --file PATH
+  ratchet-feedback submit --file PATH --title TITLE [--label L] [--repo R] [--dry-run]
+退出码:
+  collect: 0 正常 / 1 用法错误
+  lint:    0 干净（可有 warning）/ 1 有 error / 2 文件读不到
+  submit:  0 成功 / 1 lint 有 error 或提交失败 / 2 环境问题（无 gh、未认证、读不到文件）
+"""
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+BODY_MAX = 60_000  # GitHub issue 上限 65,536 字符，留余量
+BODY_MIN = 200     # 再短就不像一份能消化的 finding
+
+DEFAULT_REPO = "492577195/ratchet"
+DEFAULT_LABEL = "field-report"
+LABEL_DESC = "真实项目使用中上报的问题（/ratchet:feedback 提交）"
+
+# title 规范：「[组件] 一句话」，组件取自 bin 脚本名或领域
+# （[guard] [digest] [init] [brief] [audit] [overhead] [skill] [docs]…）。
+# label 负责「这是现场上报」，前缀负责「这是哪个部件」—— 两个维度不混。
+TITLE_PATTERN = r"^\[[^\]]+\] .+"
+
+# 必需小节 —— 缺了任何一节，维护者都消化不了这份 finding。
+# 与 skills/feedback/SKILL.md 的组装模板一一对应，改模板必须同步改这里。
+REQUIRED_SECTIONS = [
+    ("一句话", r"^##\s+一句话"),
+    ("证据链", r"^##\s+.*证据链"),
+    ("影响", r"^##\s+影响"),
+    ("修复方向", r"^##\s+修复方向"),
+    ("回归测试建议", r"^##\s+回归测试建议"),
+]
+
+# 密钥模式：error，阻断。宁可误报（用户删改后重跑），不可放过 ——
+# issue 一旦提交，内容可能被缓存/索引，收回就来不及了。
+SECRET_PATTERNS = [
+    (r"ghp_[A-Za-z0-9]{20,}", "GitHub PAT（ghp_…）"),
+    (r"github_pat_[A-Za-z0-9_]{20,}", "GitHub fine-grained PAT"),
+    (r"sk-[A-Za-z0-9]{20,}", "sk- 前缀 API key"),
+    (r"AKIA[0-9A-Z]{16}", "AWS Access Key"),
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "私钥块"),
+    (r"Bearer\s+[A-Za-z0-9._\-]{20,}", "Bearer token"),
+    (r"(?i)\b(password|token|secret|api_key)\s*[:=]\s*[^\s`]+", "口令/密钥赋值"),
+]
+
+USER_PATH = r"/(Users|home)/[^/\s]+/"  # warning：建议改写为 ~
+
+
+def version() -> str:
+    try:
+        with open(os.path.join(HERE, "..", "VERSION"), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return "unknown"
+
+
+def read_json(path: str):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def tail_lines(path: str, n: int) -> list[str]:
+    """hits.jsonl 尾 N 行，原样返回（不 parse —— 旧格式变迁不许让采集崩掉）。"""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = [ln.rstrip("\n") for ln in fh if ln.strip()]
+        return lines[-n:] if n > 0 else []
+    except OSError:
+        return []
+
+
+def collect_overhead(root: str) -> str:
+    """调同目录的 ratchet-overhead。退出码 1（超标）同样有诊断价值，都算正常。"""
+    exe = os.path.join(HERE, "ratchet-overhead")
+    try:
+        p = subprocess.run([sys.executable, exe, "--root", root],
+                           capture_output=True, text=True, timeout=20)
+        return p.stdout.strip()
+    except Exception as e:
+        return f"（ratchet-overhead 调用失败: {e}）"
+
+
+def cmd_collect(a) -> int:
+    root = os.path.abspath(a.root)
+    rd = os.path.join(root, ".ratchet")
+    initialized = os.path.isdir(rd)
+
+    info = {
+        "ratchet_version": version(),
+        "platform": "unknown",  # 刻意不猜（见 docstring），由 skill 问用户
+        "os": f"{platform.system()}-{platform.release()} {platform.machine()}",
+        "python": platform.python_version(),
+        "project": {"root_basename": os.path.basename(root), "initialized": initialized},
+        "hits_tail": [],
+    }
+    # 未 init 的项目也必须能跑 —— feedback 报的可能就是 init 自身的 bug
+    if initialized:
+        cfg = read_json(os.path.join(rd, "config.json")) or {}
+        info["project"]["preset"] = cfg.get("preset")
+        info["project"]["context_window"] = cfg.get("context_window")
+        st = read_json(os.path.join(rd, "state.json")) or {}
+        info["ratchet_state"] = {k: st[k] for k in ("current", "session") if k in st}
+        info["hits_tail"] = tail_lines(os.path.join(rd, "hits.jsonl"), a.hits)
+    info["overhead_report"] = collect_overhead(root)
+
+    json.dump(info, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+def lint_text(text: str) -> list[tuple[str, str, str]]:
+    """返回 (level, where, msg) 列表。level: error 阻断 / warning 提醒。"""
+    out = []
+    lines = text.splitlines()
+
+    for name, pat in REQUIRED_SECTIONS:
+        if not any(re.search(pat, ln) for ln in lines):
+            out.append(("error", "结构", f"缺必需小节「{name}」"))
+
+    for i, ln in enumerate(lines, 1):
+        for pat, what in SECRET_PATTERNS:
+            if re.search(pat, ln):
+                out.append(("error", f"L{i}", f"疑似{what} —— 必须删掉或改写"))
+        if re.search(USER_PATH, ln):
+            out.append(("warning", f"L{i}", "含用户目录绝对路径，建议改写为 ~"))
+
+    n = len(text.encode("utf-8"))
+    if n > BODY_MAX:
+        out.append(("error", "体积", f"body {n:,} B 超 {BODY_MAX:,} B（GitHub 上限 65,536 字符）"))
+    if n < BODY_MIN:
+        out.append(("warning", "体积", f"body 仅 {n} B —— 信息量不足以让维护者消化"))
+    return out
+
+
+def cmd_lint(a) -> int:
+    try:
+        with open(a.file, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as e:
+        print(f"ratchet-feedback: 读不到 {a.file}: {e}", file=sys.stderr)
+        return 2
+
+    findings = lint_text(text)
+    for level, where, msg in findings:
+        print(f"{where}: {level}: {msg}")
+    if not findings:
+        print("lint 干净（无 error，无 warning）")
+    return 1 if any(lv == "error" for lv, _, _ in findings) else 0
+
+
+def cmd_submit(a) -> int:
+    # lint 前置链：dry-run 也跑 —— dry-run 验证的就是完整前置，不是半截流程
+    try:
+        with open(a.file, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as e:
+        print(f"ratchet-feedback: 读不到 {a.file}: {e}", file=sys.stderr)
+        return 2
+
+    findings = lint_text(body)
+    for level, where, msg in findings:
+        print(f"{where}: {level}: {msg}", file=sys.stderr)
+    if any(lv == "error" for lv, _, _ in findings):
+        print("ratchet-feedback: lint 有 error，已阻断（无豁免 —— 改完再跑）", file=sys.stderr)
+        return 1
+
+    if not re.search(TITLE_PATTERN, a.title):
+        print(f"ratchet-feedback: ⚠️  title 不符「[组件] 一句话」规范（照提，下不为例）: {a.title}",
+              file=sys.stderr)
+
+    issue_cmd = ["gh", "issue", "create", "-R", a.repo,
+                 "--title", a.title, "--body-file", a.file]
+    if a.label:
+        issue_cmd += ["--label", a.label]
+
+    if a.dry_run:
+        n = len(body.encode("utf-8"))
+        print("dry-run：不触网，不要求 gh 存在。若真跑将执行 ——")
+        print(f"  title: {a.title}")
+        print(f"  repo:  {a.repo}")
+        print(f"  label: {a.label or '（无）'}")
+        print(f"  body:  {a.file}（{n:,} B）")
+        if a.label:
+            print(f"  $ gh label list -R {a.repo} --json name   # 查不到则：")
+            print(f"  $ gh label create {a.label} -R {a.repo}   # 创建失败则降级为无 label 提交")
+        print(f"  $ {' '.join(issue_cmd)}")
+        return 0
+
+    gh = shutil.which("gh")
+    if not gh:
+        print("ratchet-feedback: 找不到 gh CLI —— 安装后先 gh auth login；"
+              "或把 body 文件留给用户手动提交", file=sys.stderr)
+        return 2
+    p = subprocess.run([gh, "auth", "status"], capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"ratchet-feedback: gh 未认证 —— 先 gh auth login\n{p.stderr}", file=sys.stderr)
+        return 2
+
+    # label 保障：查不到就建；建不成（权限不足）降级为无 label 提交 ——
+    # 不让 label 缺失阻断上报，但必须在 stderr 明说降级发生了
+    label_args = []
+    if a.label:
+        p = subprocess.run([gh, "label", "list", "-R", a.repo, "--json", "name", "--limit", "100"],
+                           capture_output=True, text=True)
+        names = []
+        if p.returncode == 0:
+            try:
+                names = [x.get("name") for x in json.loads(p.stdout)]
+            except Exception:
+                names = []
+        if a.label in names:
+            label_args = ["--label", a.label]
+        else:
+            c = subprocess.run([gh, "label", "create", a.label, "-R", a.repo,
+                                "--description", LABEL_DESC, "--color", "1D76DB"],
+                               capture_output=True, text=True)
+            if c.returncode == 0:
+                label_args = ["--label", a.label]
+            else:
+                print(f"ratchet-feedback: ⚠️  label {a.label} 创建失败，"
+                      f"降级为无 label 提交：\n{c.stderr}", file=sys.stderr)
+
+    p = subprocess.run([gh, "issue", "create", "-R", a.repo, "--title", a.title,
+                        "--body-file", a.file] + label_args,
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"ratchet-feedback: gh issue create 失败：\n{p.stderr}", file=sys.stderr)
+        return 1
+    print(p.stdout.strip())  # issue URL 原样输出
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    pc = sub.add_parser("collect", help="采集环境事实 → JSON（离线）")
+    pc.add_argument("--root", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    pc.add_argument("--hits", type=int, default=8, help="hits.jsonl 尾 N 行（默认 8）")
+    pc.set_defaults(fn=cmd_collect)
+
+    pl = sub.add_parser("lint", help="脱敏 + 结构检查（离线）")
+    pl.add_argument("--file", required=True)
+    pl.set_defaults(fn=cmd_lint)
+
+    ps = sub.add_parser("submit", help="提交为 GitHub issue（唯一的网络层）")
+    ps.add_argument("--file", required=True)
+    ps.add_argument("--title", required=True)
+    ps.add_argument("--label", default=DEFAULT_LABEL)
+    ps.add_argument("--repo", default=DEFAULT_REPO)
+    ps.add_argument("--dry-run", action="store_true",
+                    help="打印将执行的 gh 命令 —— 不触网、不要求 gh 存在")
+    ps.set_defaults(fn=cmd_submit)
+
+    a = ap.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
