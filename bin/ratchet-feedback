@@ -30,6 +30,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -213,7 +214,7 @@ def cmd_submit(a) -> int:
         if a.label:
             print(f"  $ gh label list -R {a.repo} --json name   # 查不到则：")
             print(f"  $ gh label create {a.label} -R {a.repo}   # 创建失败则降级为无 label 提交")
-        print(f"  $ {' '.join(issue_cmd)}")
+        print(f"  $ {shlex.join(issue_cmd)}")
         return 0
 
     gh = shutil.which("gh")
