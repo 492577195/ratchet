@@ -422,32 +422,64 @@ def check_readonly(payload: dict, root: str) -> str | None:
     return None
 
 
-def record_hit(root: str, rule_id: str, decision: str) -> None:
+CMD_MAX = 200  # 命令原文落盘上限。够判定形态，又限制泄密面与文件膨胀。
+
+# hits.jsonl 可能被项目提交进版本库（ratchet-init 的 .gitignore 挡了，但项目可以覆盖），
+# 所以落盘前先抹掉常见凭据形态。宁可抹过头 —— 判定命中真伪不需要密钥原文。
+_SECRET = re.compile(
+    r"(gh[pousr]_[A-Za-z0-9]{16,}"
+    r"|sk-[A-Za-z0-9_-]{16,}"
+    r"|AKIA[0-9A-Z]{12,}"
+    r"|(?i:bearer)\s+[A-Za-z0-9._-]{16,}"
+    r"|(?i:(?:password|passwd|token|secret|api[_-]?key))\s*[=:]\s*\S+)"
+)
+
+
+def _redact(cmd: str) -> str:
+    """抹凭据 + 压空白 + 截断。顺序要紧：先抹再截，否则截断可能留下半截密钥。"""
+    return _SECRET.sub("«REDACTED»", " ".join(cmd.split()))[:CMD_MAX]
+
+
+def record_hit(root: str, rule_id: str, decision: str,
+               cmd: str = "", fallback: str | None = None) -> None:
     """记一笔命中。这是棘爪释放的数据基础 —— 没有命中统计，减法就只能靠拍脑袋。
 
     失败绝不能影响拦截本身：审计是次要的，门禁是主要的。
+
+    **为什么要落 cmd 和 fallback**（2026-07-27，见 docs/finding-hits-无命令原文.md）：
+    首版只记 rule/decision/at，复盘时在 hits.jsonl 内部判不出「真拦还是误拦」。
+    下游项目连续 5 次会话对 35 条命中一律「沿先例 dismissed」，转化率 0。
+    原文其实能从会话 transcript 反查（那份 finding 断言「不可回溯」是错的），
+    但每次要写脚本按秒级时间戳比对 —— 落盘把这个成本降到零。
+
+    `fallback` 比 `cmd` 更省事：它直接说明这次匹配走的是切词还是原文回退。
+    实测 11 条命中里 4 条误判，**全部** fallback=heredoc —— 有这个字段，
+    一眼就能分流，不必逐条读命令。
     """
     try:
         rd = os.path.join(root, ".ratchet")
         if not os.path.isdir(rd):
             return
-        line = json.dumps(
-            {"rule": rule_id, "decision": decision,
-             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")},
-            ensure_ascii=False,
-        )
+        rec = {"rule": rule_id, "decision": decision,
+               "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
+        if cmd:
+            rec["cmd"] = _redact(cmd)
+        if fallback:
+            rec["fallback"] = fallback
+        line = json.dumps(rec, ensure_ascii=False)
         with open(os.path.join(rd, "hits.jsonl"), "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except Exception:
         pass
 
 
-def emit(decision: str | None, reason: str = "", rule_id: str = "", root: str = "") -> int:
+def emit(decision: str | None, reason: str = "", rule_id: str = "", root: str = "",
+         cmd: str = "", fallback: str | None = None) -> int:
     if decision is None:
         print("{}")
         return 0
     if rule_id and root:
-        record_hit(root, rule_id, decision)
+        record_hit(root, rule_id, decision, cmd, fallback)
     json.dump(
         {"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -480,7 +512,12 @@ def main() -> int:
     # 放到 extract_command 之后就永远轮不到它。
     ro = check_readonly(payload, root)
     if ro:
-        return emit("deny", ro, "readonly", root)
+        # readonly 拦的是 Edit/Write，没有 command 字段 —— 落工具名 + 目标路径，
+        # 否则这一类命中会成为唯一判不出真伪的盲区。
+        ti = payload.get("tool_input") or {}
+        return emit("deny", ro, "readonly", root,
+                    f"[{payload.get('tool_name', '?')}] "
+                    f"{ti.get('file_path') or ti.get('notebook_path') or ''}".strip())
 
     cmd = extract_command(payload)
     if not cmd:
@@ -491,15 +528,15 @@ def main() -> int:
 
     for rid, pat, why in DENY:
         if pat.search(scan):
-            return emit("deny", why + note, rid, root)
+            return emit("deny", why + note, rid, root, cmd, fallback)
 
     slop = check_install(scan, root)
     if slop:
-        return emit("ask", slop, "slopsquatting", root)
+        return emit("ask", slop, "slopsquatting", root, cmd, fallback)
 
     for rid, pat, why in ASK:
         if pat.search(scan):
-            return emit("ask", why + note, rid, root)
+            return emit("ask", why + note, rid, root, cmd, fallback)
 
     return emit(None)
 
