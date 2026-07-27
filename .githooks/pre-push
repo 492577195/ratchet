@@ -50,12 +50,16 @@ if [ "$PUSHING_MAIN" = "1" ]; then
   V_FILE=$(cat VERSION 2>/dev/null | tr -d ' \n')
   V_CC=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])" 2>/dev/null)
   V_CX=$(python3 -c "import json;print(json.load(open('.codex-plugin/plugin.json'))['version'])" 2>/dev/null)
+  V_MK1=$(python3 -c "import json;print(json.load(open('.claude-plugin/marketplace.json'))['version'])" 2>/dev/null)
+  V_MK2=$(python3 -c "import json;print(json.load(open('.claude-plugin/marketplace.json'))['metadata']['version'])" 2>/dev/null)
 
-  # 2a. 三处版本号必须一致 —— 不一致会导致两个平台装到不同版本
-  if [ "$V_FILE" = "$V_CC" ] && [ "$V_FILE" = "$V_CX" ]; then
-    good "版本号三处一致：$V_FILE"
+  # 2a. 五处版本号必须一致 —— 不一致会导致两个平台装到不同版本。
+  #     marketplace.json 曾掉队到 0.1.0 无人发现（v0.1.10 时代 dogfood 抓到）：
+  #     漏检的不是「没人看的字段」，是门禁的盲区。
+  if [ "$V_FILE" = "$V_CC" ] && [ "$V_FILE" = "$V_CX" ] && [ "$V_FILE" = "$V_MK1" ] && [ "$V_FILE" = "$V_MK2" ]; then
+    good "版本号五处一致：$V_FILE"
   else
-    bad "版本号不一致 — VERSION=$V_FILE  claude=$V_CC  codex=$V_CX"
+    bad "版本号不一致 — VERSION=$V_FILE claude=$V_CC codex=$V_CX marketplace=$V_MK1/$V_MK2"
   fi
 
   # 2b. 版本号必须比最新 tag 新

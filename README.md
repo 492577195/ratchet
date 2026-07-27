@@ -136,8 +136,9 @@ codex plugin add ratchet@ratchet
 | AI 又犯了一次不该犯的错 | `/ratchet:ratchet` | 把这次失败转成**永久物理约束** —— 优先写成校验器，写不成才写规则 |
 | 上下文用到 60–70%，任务告一段落 | `/ratchet:handoff` | 产出交接文件，然后安全 `/clear`，用干净上下文继续 |
 | 规则越积越多，维护流程比干活还累 | `/ratchet:slim` | 做减法 —— 零命中的规则淘汰，高频命中的软规则升级成硬校验器 |
+| ratchet 自己的行为不对劲 | `/ratchet:feedback` | 把现场问题打包成 GitHub issue —— 脚本采事实，AI 补语义，脱敏确认后提交 |
 
-这三个是配套的：`ratchet` 咬合（加约束），`slim` 松开棘爪（还上下文预算），`handoff` 换弹匣（换干净上下文）。**`/ratchet:slim` 和 `/ratchet:ratchet` 一样重要** —— 理由见上面[「名字：棘轮与棘爪」](#名字棘轮与棘爪)。
+这三个是配套的：`ratchet` 咬合（加约束），`slim` 松开棘爪（还上下文预算），`handoff` 换弹匣（换干净上下文）。**`/ratchet:slim` 和 `/ratchet:ratchet` 一样重要** —— 理由见上面[「名字：棘轮与棘爪」](#名字棘轮与棘爪)。在 ratchet 仓一侧，上报来的 issue 由 `/ratchet:triage` 消化：拉取、核实、红断言修复、关闭。
 
 ## 它长什么样
 
@@ -268,9 +269,10 @@ bin/ratchet-digest     收尾自动留痕（SessionEnd）
 bin/ratchet-context    上下文占比（statusLine）
 bin/ratchet-overhead   机制税审计 —— 给脚手架自己做体检
 bin/ratchet-audit      减法审计 —— 棘爪释放的数据来源
+bin/ratchet-feedback   现场问题上报（collect 采集 / lint 脱敏 / submit 提 issue）
 lib/transcript.py      transcript 共享解析器
 hooks.json             双平台共用（一份两用）
-skills/                init · handoff · ratchet · slim
+skills/                init · handoff · ratchet · slim · feedback · triage
 templates/constitution.md   纪律基线（硬上限 4 KB）
 schema/state.schema.json
 ```

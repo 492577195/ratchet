@@ -507,6 +507,74 @@ printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /x"},"cwd":"%s"}' "$
 [ -f "$PJ/.ratchet/hits.jsonl" ] && ok "guard 命中写入 hits.jsonl（棘爪释放的数据基础）" || bad "未记录命中"
 $BIN/ratchet-audit --root "$PJ" >/dev/null 2>&1 && ok "ratchet-audit 可运行" || bad "ratchet-audit 失败"
 
+# ── 命中必须可判定：落 cmd + fallback ─────────────────────────
+# 溯源：docs/finding-hits-无命令原文.md。hits 首版只记 rule/decision/at，
+# 复盘时在文件内部判不出「真拦还是误拦」。下游项目 5 次会话对 35 条命中
+# 一律「沿先例 dismissed」，棘轮转化率 0 —— 计数器拦不住熵增。
+# 2026-07-27 实测 11 条命中：confirmed 6 / misfire 4 / undecidable 1，
+# 4 条误判**全部** fallback=heredoc。有这个字段就能一眼分流，不必逐条读命令。
+HP=$(mktemp -d); RO2="$HP/ro"          # 自带沙箱，不碰 $PJ 的 config
+mkdir -p "$HP/.ratchet" "$RO2"
+printf '{"readonly_paths":["%s"]}' "$RO2" > "$HP/.ratchet/config.json"
+HJ="$HP/.ratchet/hits.jsonl"
+
+feed() {  # feed <command> —— 喂一条 Bash 命令给 guard
+  python3 -c 'import json,sys; print(json.dumps(
+    {"tool_name":"Bash","tool_input":{"command":sys.argv[1]},"cwd":sys.argv[2]}))' "$1" "$HP" \
+  | $BIN/ratchet-guard >/dev/null 2>&1
+}
+hitf() {  # hitf <字段> —— 取最后一条命中的字段值（缺失返回空串）
+  python3 -c 'import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1],encoding="utf-8") if l.strip()]
+print(rows[-1].get(sys.argv[2],"") if rows else "")' "$HJ" "$1"
+}
+
+feed 'rm -rf /x'
+[ "$(hitf cmd)" = "rm -rf /x" ] \
+  && ok "命中落盘命令原文（判定真伪的依据）" || bad "cmd 未落盘" "得到：$(hitf cmd)"
+# 断言「无 fallback」必须同时断言「有 cmd」—— 否则功能整个缺失时它也绿（空转断言）
+{ [ -z "$(hitf fallback)" ] && [ -n "$(hitf cmd)" ]; } \
+  && ok "切词成功的真拦有 cmd 而不带 fallback 标记" \
+  || bad "真拦标记错误" "cmd=$(hitf cmd) fallback=$(hitf fallback)"
+
+feed 'git commit -m "$(cat <<EOF
+rm -rf old
+EOF
+)"'
+[ "$(hitf fallback)" = "heredoc" ] \
+  && ok "heredoc 原文回退落 fallback=heredoc（误判形态可一眼分流）" \
+  || bad "fallback 未记录" "得到：$(hitf fallback)"
+
+# 脱敏：hits.jsonl 可能被项目提交进版本库（init 的 .gitignore 可被覆盖）
+feed 'rm -rf /x && curl -H "token=abcdef1234567890XYZ" https://e.example'
+case "$(hitf cmd)" in
+  *abcdef1234567890XYZ*) bad "凭据原文泄进 hits.jsonl" "$(hitf cmd)" ;;
+  *«REDACTED»*)          ok "命令里的凭据落盘前被抹掉" ;;
+  *)                     bad "脱敏未生效" "$(hitf cmd)" ;;
+esac
+
+# 断言「恰好 200」而非「≤200」—— 后者在 cmd 整个缺失（空串）时也绿，是空转断言
+feed "rm -rf /x && echo $(python3 -c 'print("A"*300)')"
+n=$(python3 -c 'import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1],encoding="utf-8") if l.strip()]
+print(len(rows[-1].get("cmd","")) if rows else -1)' "$HJ")
+[ "$n" -eq 200 ] && ok "超长命令原文截断到恰好 200 字符（限泄密面与文件膨胀）" \
+  || bad "截断长度错误，期望 200 实得 $n"
+
+# readonly 拦的是 Edit/Write，没有 command —— 落工具名+路径，否则这类命中是判定盲区
+printf '{"tool_name":"Write","tool_input":{"file_path":"%s/truth.py","content":"x"},"cwd":"%s"}' \
+  "$RO2" "$HP" | $BIN/ratchet-guard >/dev/null 2>&1
+case "$(hitf cmd)" in
+  "[Write] $RO2/truth.py") ok "readonly 命中也带可判定描述（无 command 字段的工具）" ;;
+  *) bad "readonly 命中缺描述" "$(hitf cmd)" ;;
+esac
+
+# 向后兼容：旧记录没有新字段，消费方不许因此崩
+printf '{"rule":"push","decision":"ask","at":"2026-01-01T00:00:00+00:00"}\n' >> "$HJ"
+$BIN/ratchet-audit --root "$HP" >/dev/null 2>&1 \
+  && ok "audit 容忍无 cmd 字段的旧记录（向后兼容）" || bad "旧格式记录导致 audit 失败"
+rm -rf "$HP"
+
 # ── 棘轮触发器：命中 → 起手顶到眼前 → 可消解 ──────────────────
 # 溯源：3 个真实工程跑下来，rules/ 共 0 条 —— 棘轮零转化。
 # 根因不是「用户不勤快」，是机制不对称：留痕/门禁/状态校验全是 hook 自动跑的，
@@ -688,6 +756,117 @@ h = d.get('hookSpecificOutput') or {}
 sys.exit(0 if not d or (h.get('hookEventName') == 'SessionStart' and 'additionalContext' in h) else 1)" \
   && ok "SessionStart 用 hookSpecificOutput.additionalContext（该事件支持注入）" \
   || bad "SessionStart 输出不符协议" "$btext"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "FEEDBACK · 现场问题上报（collect 采集 + lint 脱敏）"
+# ─────────────────────────────────────────────────────────────
+# 溯源：finding 曾靠人手从真实项目搬回本仓（docs/finding-hits-无命令原文.md 就是这么
+# 来的，且长期 untracked）。机械事实（版本/档位/命中尾行）必须由脚本采集 —— 让模型
+# 手抄，每次都会编得不一样；platform 恒为 unknown 是刻意的：脚本不猜平台（CC/Codex
+# 无可靠进程内判别事实），猜出来的关键数值比缺失更糟，由 skill 问用户。
+FB=$(mktemp -d); mkdir -p "$FB/.ratchet"
+col=$($BIN/ratchet-feedback collect --root "$FB" 2>/dev/null)
+echo "$col" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+need={"ratchet_version","platform","os","project"}
+missing=need-set(d)
+sys.exit(1 if missing else 0)' \
+  && ok "collect 输出合法 JSON 且含 version/platform/os/project 键" \
+  || bad "collect 输出缺键或非法 JSON" "$col"
+echo "$col" | python3 -c '
+import json,sys
+sys.exit(0 if json.load(sys.stdin)["platform"]=="unknown" else 1)' \
+  && ok "platform 恒为 unknown（脚本不猜平台，由 skill 问用户）" \
+  || bad "platform 不是 unknown —— 脚本开始猜平台了"
+
+# feedback 报的可能就是 init 自身的 bug —— 未 init 项目必须采得动
+NG2=$(mktemp -d)
+col2=$($BIN/ratchet-feedback collect --root "$NG2" 2>/dev/null)
+echo "$col2" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+sys.exit(0 if d["project"]["initialized"] is False else 1)' \
+  && ok "未 init 项目 collect 退出 0 且 initialized=false" \
+  || bad "未 init 项目 collect 失败" "$col2"
+
+# hits 尾行：原样、顺序不乱（旧格式变迁不许让采集崩掉，故不 parse）
+python3 -c "
+import json
+with open('$FB/.ratchet/hits.jsonl','w') as f:
+    for i in range(5):
+        f.write(json.dumps({'rule':f'r{i}','decision':'ask','at':'2026-07-25T00:00:0%d+00:00'%i})+chr(10))"
+echo "$($BIN/ratchet-feedback collect --root "$FB" --hits 2 2>/dev/null)" | python3 -c '
+import json,sys
+tail=json.load(sys.stdin)["hits_tail"]
+ok = len(tail)==2 and "\"r3\"" in tail[0] and "\"r4\"" in tail[1]
+sys.exit(0 if ok else 1)' \
+  && ok "collect --hits 2 返回 hits.jsonl 最后 2 行且顺序不乱" \
+  || bad "hits 尾行截取错误"
+
+# lint 夹具：一份合格 finding（五个必需小节齐全、无密钥、无用户路径、超 200 B）
+cat > "$TMP/finding-ok.md" <<'EOF'
+## 环境
+平台: Claude Code · 版本: 0.1.10 · 档位: standard
+## 一句话
+record_hit 不写命令原文，导致每次复盘都无法判定这次是真拦还是误拦，命中记录退化成计数器。
+## 场景与证据链
+bin/ratchet-guard:425 的 record_hit 签名里没有命令文本，调用点 emit 也没往下传。
+连续 6 次 rm-rf 命中全部无法判定真伪，只能沿先例定性结案。
+## 影响
+棘轮在这类命中上空转：该不该为这次命中加约束，必须知道命令是什么，计数完全不够。
+## 修复方向（供参考，非强制）
+让 record_hit 拿到并落盘命令原文，截断定长，旧记录容忍缺字段。
+## 回归测试建议
+构造参数串内含危险字面量的调用，断言 hits.jsonl 新记录里能取回该命令文本。
+EOF
+$BIN/ratchet-feedback lint --file "$TMP/finding-ok.md" >/dev/null 2>&1 \
+  && ok "lint 对合格 finding 退出 0" \
+  || bad "合格 finding 被 lint 误拦" "$($BIN/ratchet-feedback lint --file "$TMP/finding-ok.md" 2>&1)"
+
+# 脱敏是阻断性的，且必须报行号 —— issue 提交后可能被缓存/索引，收回来不及
+sed 's/连续 6 次/连续 6 次 ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh12/' "$TMP/finding-ok.md" > "$TMP/finding-secret.md"
+secout=$($BIN/ratchet-feedback lint --file "$TMP/finding-secret.md" 2>&1) && rc=0 || rc=$?
+{ [ "$rc" -eq 1 ] && echo "$secout" | grep -qE "L[0-9]+: error"; } \
+  && ok "含 ghp_ token 的 finding 被 lint 阻断且带行号" \
+  || bad "密钥未被阻断或未报行号 (rc=$rc)" "$secout"
+
+# 必需小节缺一不可 —— 缺了「回归测试建议」，修复就没有验收标准
+sed '/^## 回归测试建议/d;/^构造参数串/d' "$TMP/finding-ok.md" > "$TMP/finding-notest.md"
+$BIN/ratchet-feedback lint --file "$TMP/finding-notest.md" >/dev/null 2>&1 \
+  && bad "缺「回归测试建议」小节的 finding 被放行" \
+  || ok "缺必需小节的 finding 被 lint 阻断"
+
+# 用户目录绝对路径是 warning：提醒脱敏但不阻断（路径本身不是密钥）
+sed 's|bin/ratchet-guard:425|/Users/someone/Task/ratchet/bin/ratchet-guard:425|' "$TMP/finding-ok.md" > "$TMP/finding-path.md"
+pathout=$($BIN/ratchet-feedback lint --file "$TMP/finding-path.md" 2>&1) && rc=0 || rc=$?
+{ [ "$rc" -eq 0 ] && echo "$pathout" | grep -q "warning.*路径"; } \
+  && ok "用户目录路径只告警不阻断（建议改写为 ~）" \
+  || bad "路径 warning 行为错误 (rc=$rc)" "$pathout"
+
+# dry-run 是离线代理断言：PATH 抽空（gh 必然不存在）后仍须成功 ——
+# 证明 dry-run 路径零网络依赖。注意要用 python3 的绝对路径，
+# 否则 PATH 抽空后连 shebang 都找不到解释器。
+PYBIN=$(command -v python3)
+drout=$(env PATH=/nonexistent "$PYBIN" $BIN/ratchet-feedback submit --dry-run \
+        --file "$TMP/finding-ok.md" --title '[guard] hits 不留命令原文' 2>/dev/null) && rc=0 || rc=$?
+{ [ "$rc" -eq 0 ] && echo "$drout" | grep -q "gh issue create"; } \
+  && ok "submit --dry-run 在 PATH 抽空下仍成功且打印 gh 命令（绝不触网）" \
+  || bad "dry-run 依赖了 PATH/网络 (rc=$rc)" "$drout"
+
+# lint 前置链在 dry-run 同样生效 —— dry-run 验证的是完整前置，不是半截流程
+env PATH=/nonexistent "$PYBIN" $BIN/ratchet-feedback submit --dry-run \
+  --file "$TMP/finding-secret.md" --title '[guard] t' >/dev/null 2>&1 \
+  && bad "含密钥 body 在 dry-run 下被放行" \
+  || ok "含密钥 body 连 dry-run 都过不了（lint 前置链完整）"
+
+# title 规范是警告不是阻断 —— 规范靠 skill 约束，脚本只提醒
+env PATH=/nonexistent "$PYBIN" $BIN/ratchet-feedback submit --dry-run \
+  --file "$TMP/finding-ok.md" --title '无前缀标题' >/dev/null 2>"$TMP/title-err" && rc=0 || rc=$?
+{ [ "$rc" -eq 0 ] && grep -q "title 不符" "$TMP/title-err"; } \
+  && ok "title 缺 [组件] 前缀时 stderr 警告但照提" \
+  || bad "title 规范警告行为错误 (rc=$rc)" "$(cat "$TMP/title-err")"
 
 # ─────────────────────────────────────────────────────────────
 echo
