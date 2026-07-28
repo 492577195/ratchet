@@ -182,15 +182,23 @@ $ pip install requests-toolbelt-pro
 **给脚手架自己做体检（`ratchet-overhead`）**
 
 ```
-🔥 热区（每次会话可能进上下文 · 必须恒定）  10.9 KB
-        3.8 KB  AGENTS.md
-        1.1 KB  .ratchet/state.json
+🔥 热区（每次会话可能进上下文 · 必须恒定）  6.6 KB
+        3.9 KB  AGENTS.md
+        1.9 KB  .ratchet/rules/read-source-first.md
          413 B  CLAUDE.md
+         401 B  .ratchet/state.json
+          54 B  .ratchet/config.json
 
-🧊 冷区（归档 · 只检索不加载 · 长多大都行）  4.9 KB
+🧊 冷区（归档 · 只检索不加载 · 长多大都行）  10.8 KB
+     7 个文件
+     其中 session 日志 6 份（全部冷区 —— 没有机制会自动加载它们）
 
-热区 10.9 KB / 预算 12.0 KB  (90%)  🟢 健康
+热区 6.6 KB / 预算 12.0 KB  (55%)  🟢 健康
 ```
+
+热区里只有真会进上下文的东西：宪法（`AGENTS.md`）、规则、简报的数据源。
+**会话日志不在其中** —— 没有任何 hook 会自动加载它们，所以 6 份也好 60 份也好，
+热区纹丝不动。这就是「机制税与项目年龄无关」的具体含义。
 
 机制税是可测量的，所以它可以被管住。
 

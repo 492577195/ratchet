@@ -26,8 +26,7 @@ import argparse
 import os
 import sys
 
-HOT_BUDGET = 12 * 1024  # 热区总预算 12 KB（简报 2K + 宪法 4K + 最近 3 份日志 + 规则）
-RECENT_LOGS = 3         # 只有最近 N 份日志算热区，其余是冷区
+HOT_BUDGET = 12 * 1024  # 热区总预算 12 KB（简报 2K + 宪法 4K + 规则 + 余量）
 
 
 def size(p: str) -> int:
@@ -77,16 +76,27 @@ def main() -> int:
         for p in walk(rules_dir):
             hot[os.path.relpath(p, root)] = size(p)
 
-    # session 日志：最近 N 份算热区，其余全是冷区
+    # session 日志：全量冷区。
+    #
+    # 判据是「真的会进上下文吗」，不是「是不是机制文件」—— constitution.md 已经
+    # 因为同一个误判虚报过 489 B。日志是同型复发，量级大得多（下游实测 7.2 KB，
+    # 直接把 12.9 KB / 12.0 KB 报成 107% 超标）。
+    #
+    # 逐条核实过没有任何自动加载通路（GitHub #6）：hooks.json 只有 4 个 hook；
+    # SessionStart 注入的 additionalContext 只有 render(state)，不含日志正文；
+    # digest 读 log 仅为 _find_by_transcript 的指纹去重，是脚本内部读盘；
+    # handoff 按需读，那是 skill 被调用时，不是自动加载。
+    #
+    # 误报的代价不只是数字难看：它会把用户推去跑 /slim 做无谓减法，砍掉的可能
+    # 正是有价值的留痕节奏 —— 惩罚的恰恰是留痕最勤的用户。而且狼来了效应会
+    # 蔓延到真实超标场景。预算 12 KB 是 K4 承诺的反推，不动它，只改归属。
     logs = []
     for base in ("track", "Worklog", ".ratchet/log"):
         d = os.path.join(root, base)
         if os.path.isdir(d):
             logs += [p for p in walk(d) if p.endswith(".md")]
-    logs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    for i, p in enumerate(logs):
-        rel = os.path.relpath(p, root)
-        (hot if i < RECENT_LOGS else cold)[rel] = size(p)
+    for p in logs:
+        cold[os.path.relpath(p, root)] = size(p)
 
     # 冷区：归档 + plugin 产物副本 —— 不进上下文，想多大多大
     for base in ("PLAN", "iterations", ".ratchet/archive"):
@@ -112,7 +122,7 @@ def main() -> int:
     print(f"\n🧊 冷区（归档 · 只检索不加载 · 长多大都行）  {human(cold_total)}")
     print(f"     {len(cold)} 个文件")
     if logs:
-        print(f"     其中 session 日志 {len(logs)} 份（热区仅保留最近 {RECENT_LOGS} 份）")
+        print(f"     其中 session 日志 {len(logs)} 份（全部冷区 —— 没有机制会自动加载它们）")
 
     print("\n" + "-" * 58)
     pct = hot_total * 100 // a.budget if a.budget else 0

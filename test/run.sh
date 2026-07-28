@@ -723,6 +723,32 @@ hotout=$($BIN/ratchet-overhead --root "$PJ" 2>/dev/null)
 echo "$hotout" | sed -n '/热区（/,/冷区/p' | grep -q "constitution.md" \
   && bad "constitution.md 被误算进热区（它不进上下文，会导致重复计数）" \
   || ok "constitution.md 归入冷区（不进上下文，避免与 AGENTS.md 重复计数）"
+
+# 同一条判据的第二次应用：会话日志也不进上下文（GitHub #6）。
+# constitution.md 那次虚报 489 B；日志这次量级大得多 —— 下游实测 12.9 KB / 12.0 KB
+# 报「超标」107%，其中 7.2 KB 全是日志。误报会把用户推去跑 /slim 做无谓减法，
+# 砍掉的可能正是有价值的留痕节奏，且会稀释真实超标的可信度。
+# 论证（本次逐条核实）：hooks.json 只有 4 个 hook；SessionStart 注入的
+# additionalContext 只有 render(state)，不含日志正文；digest 读 log 仅为
+# _find_by_transcript 的指纹去重（脚本内部读盘，不进上下文）；handoff 是
+# skill 被调用时按需读，不是自动加载。没有第五条通路 —— 日志全量归冷区。
+LG=$(mktemp -d); $BIN/ratchet-init --preset standard --root "$LG" >/dev/null 2>&1
+pct0=$($BIN/ratchet-overhead --root "$LG" 2>/dev/null | grep -o '([0-9]*%)' | head -1)
+for i in 1 2 3 4; do
+  head -c 4000 /dev/zero | tr '\0' 'x' > "$LG/.ratchet/log/2026-07-2${i}-s${i}.md"
+done
+lgout=$($BIN/ratchet-overhead --root "$LG" 2>/dev/null)
+echo "$lgout" | sed -n '/热区（/,/冷区/p' | grep -q ".ratchet/log" \
+  && bad "会话日志被算进热区 —— 无任何机制自动加载它们，这是虚高" \
+    "$(echo "$lgout" | sed -n '/热区（/,/冷区/p')" \
+  || ok "会话日志归入冷区（无机制自动加载，热区只算真进上下文的）"
+# 不变量：热区占比不该随日志体积变化。比「列表里没有」更难糊弄 ——
+# 万一将来换了渲染方式、列表不显示但仍在计数，这条照样能抓到。
+pct1=$(echo "$lgout" | grep -o '([0-9]*%)' | head -1)
+[ "$pct0" = "$pct1" ] \
+  && ok "加 16 KB 日志后热区占比不变（${pct0} → ${pct1}，热区与项目年龄无关）" \
+  || bad "热区占比随日志体积变了：${pct0} → ${pct1} —— K4 承诺被打破"
+rm -r "$LG"
 rm -rf "$PJ"
 
 # ─────────────────────────────────────────────────────────────
