@@ -102,6 +102,47 @@ def days_since(iso: str) -> int:
         return 9999
 
 
+def ack_log(root: str) -> int:
+    """把「上次会话日志未写」的提醒消解掉 —— 与 --ack 同源的退路（GitHub #5）。
+
+    digest 落草稿后置 log_written=false，全仓无任何代码置回 true，回写靠 handoff
+    让人/AI 手改 state。这是有意设计：那一段本来就该人写。
+    但对照 hits —— 命中提示有 --ack（看过并判定不值得写规则也是正当结论），
+    日志提醒却没有等价物。用户一旦决定「这篇不补」，唯一的消解法是撒谎
+    （手改 false→true）或学会无视。两种都腐蚀机制的可信度。
+
+    消解不是永久消音：只记下当前会话号，新会话落草稿后 last 前进，提醒自动回来。
+    """
+    p = os.path.join(root, ".ratchet", "state.json")
+    if not os.path.isfile(p):
+        print("没有 state.json —— 还没初始化。", file=sys.stderr)
+        return 1
+    try:
+        st = json.load(open(p, encoding="utf-8"))
+    except Exception as e:
+        print(f"state.json 读不出来：{e}", file=sys.stderr)
+        return 1
+
+    sess = st.setdefault("session", {})
+    if sess.get("log_written") is not False:
+        print("当前没有待补写的日志提醒 —— 无需消解。")
+        return 0
+
+    n = int(sess.get("last") or 0)
+    if sess.get("log_dismissed") == n:
+        print(f"s-{n} 的日志提醒已经消解过了 —— 没有重复动作。")
+        return 0
+
+    sess["log_dismissed"] = n
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+
+    print(f"✅ 已消解 s-{n} 的日志提醒。起手简报不再提示它。")
+    print("   注意：这只是让提示闭嘴，日志本身还是没写。下次会话落了新草稿，提醒会回来。")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--root", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
@@ -109,12 +150,17 @@ def main() -> int:
     ap.add_argument("--ack", action="append", metavar="RULE",
                     help="把该规则的命中标记为已处理（已转化成校验器，或看过后判定不值得）")
     ap.add_argument("--ack-all", action="store_true", help="把所有未处理命中标记为已处理")
+    ap.add_argument("--ack-log", action="store_true",
+                    help="消解「上次会话日志未写」的提醒（决定这篇不补，也是正当结论）")
     a = ap.parse_args()
     root = a.root
 
     if not os.path.isdir(os.path.join(root, ".ratchet")):
         print("未初始化（没有 .ratchet/）。先跑 /ratchet:init", file=sys.stderr)
         return 1
+
+    if a.ack_log:
+        return ack_log(root)
 
     if a.ack or a.ack_all:
         return ack_hits(root, a.ack or [], a.ack_all)

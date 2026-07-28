@@ -111,6 +111,11 @@
         "log_written": {
           "type": "boolean",
           "description": "最近一次会话的日志是否已写。false 时 SessionStart 会提示补写（纪律：工作留痕）。"
+        },
+        "log_dismissed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "已被 `ratchet-audit --ack-log` 消解的会话编号。仅当它等于 last 时提醒才闭嘴 —— 新会话落草稿后 last 前进，提醒自动重新生效。缺省即『未消解』（老 state 向后兼容）。存在的理由：没有退路的提示会被学会无视，而被无视的提示比没有更糟。"
         }
       }
     },

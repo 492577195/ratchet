@@ -609,6 +609,56 @@ with open('$WB/.ratchet/hits.jsonl','w') as f:
 n=$($BIN/ratchet-brief --state "$WB/.ratchet/state.json" | wc -c | tr -d ' ')
 [ "$n" -le 2048 ] && ok "最坏 state + 20 种未处理命中仍 ${n} B ≤ 2048 B（K1 未被提示挤爆）" \
   || bad "提示挤爆了 K1 预算：${n} B > 2048 B"
+
+# ── 日志提醒同样要有退路 ──────────────────────────────────────
+# 溯源：GitHub #5。digest 落草稿后置 log_written=false，全仓无任何代码置回 true，
+# 回写靠 handoff 让人/AI 手改 state —— 这是有意设计。但对照 hits：命中提示有
+# --ack 消解（看过并判定不值得写规则也是正当结论），日志提醒没有等价物。
+# 用户一旦决定「这篇不补」，唯一的消解法是撒谎（手改 false→true）或学会无视。
+# 两种都腐蚀机制可信度 —— 提示必须自带出口，这条判据上面 hits 段已经写过一遍了。
+LW=$(mktemp -d); $BIN/ratchet-init --preset standard --root "$LW" >/dev/null 2>&1
+LWS="$LW/.ratchet/state.json"
+python3 -c "
+import json; p='$LWS'; d=json.load(open(p))
+d['session']={'last':3,'last_date':'2026-07-21','log_written':False}
+json.dump(d,open(p,'w'),ensure_ascii=False)"
+$BIN/ratchet-brief --state "$LWS" | grep -q "日志未写" \
+  && ok "log_written=false 时起手顶出日志提醒" \
+  || bad "日志提醒没出现 —— 夹具或判据错了"
+$BIN/ratchet-brief --state "$LWS" | grep -q -- "--ack-log" \
+  && ok "日志提醒自带消解命令（与 hits 提示同款：提示必须给出口）" \
+  || bad "日志提醒没给退路 —— 用户只能撒谎或学会无视"
+
+$BIN/ratchet-audit --root "$LW" --ack-log >/dev/null 2>&1
+$BIN/ratchet-brief --state "$LWS" | grep -q "日志未写" \
+  && bad "--ack-log 后提醒仍在 —— 退路无效" \
+  || ok "--ack-log 后日志提醒消失"
+$BIN/ratchet-state --state "$LWS" >/dev/null 2>&1 \
+  && ok "--ack-log 写回的 state 仍通过 schema 校验" \
+  || bad "--ack-log 写出了非法 state —— schema 没同步"
+# 重复消解不该再报一次「已消解」—— log_written 仍是 false，天真实现会重复动作
+$BIN/ratchet-audit --root "$LW" --ack-log 2>&1 | grep -q "已经消解过" \
+  && ok "重复 --ack-log 如实说「已消解过」而非再报一次成功" \
+  || bad "重复 --ack-log 谎报了一次新消解"
+
+# 消解不是永久消音：新会话再落草稿，提醒必须重新生效
+python3 -c "
+import json; p='$LWS'; d=json.load(open(p))
+d['session']['last']=4; d['session']['log_written']=False
+json.dump(d,open(p,'w'),ensure_ascii=False)"
+$BIN/ratchet-brief --state "$LWS" | grep -q "日志未写" \
+  && ok "消解后新会话的日志提醒重新出现（不是永久消音）" \
+  || bad "消解把后续所有提醒都关掉了 —— 那是消音器不是退路"
+
+# 向后兼容：老 state 没有消解字段，必须视为「未消解」
+python3 -c "
+import json; p='$LWS'; d=json.load(open(p))
+d['session']={'last':5,'log_written':False}   # 干净的老格式，无消解标记
+json.dump(d,open(p,'w'),ensure_ascii=False)"
+$BIN/ratchet-brief --state "$LWS" | grep -q "日志未写" \
+  && ok "无消解字段的老 state 视为未消解（向后兼容）" \
+  || bad "老 state 被当成已消解 —— 存量提醒被静默吞掉"
+rm -r "$LW"
 rm -r "$WB"
 
 # init 必须把运行时数据挡在版本库外。
