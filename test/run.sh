@@ -779,6 +779,24 @@ ckok=$($BIN/ratchet-init --check --root "$GI" 2>&1)
 echo "$ckok" | grep -qi "缺" \
   && bad "已就绪的项目被 --check 误报缺口" "$ckok" \
   || ok "--check 对已就绪项目不虚报缺口"
+# 更宽的规则同样算已挡住。溯源：v0.1.12 首版用字符串哨兵
+# `".ratchet/hits.jsonl" in cur` 判定，于是在 ratchet 自己的仓上误报 ——
+# 本仓 .gitignore 写的是 `.ratchet/`，整个目录都挡了，比那 4 条更宽，
+# 却被报成「缺口」，还建议去追加冗余条目。判据改为问 git check-ignore。
+# 假警报比没有警报更糟：它会训练用户忽略这一栏。
+WIDE=$(mktemp -d); git -C "$WIDE" init -q; mkdir -p "$WIDE/.ratchet"
+printf '.ratchet/\n' > "$WIDE/.gitignore"
+ckw=$($BIN/ratchet-init --check --root "$WIDE" 2>&1)
+echo "$ckw" | grep -qi "缺" \
+  && bad "更宽的 .ratchet/ 规则被误报成缺口（它其实什么都挡住了）" "$ckw" \
+  || ok "--check 认更宽的忽略规则（问 git，不做字符串匹配）"
+# 同一判据也该让 init 不再追加冗余条目
+$BIN/ratchet-init --preset standard --root "$WIDE" >/dev/null 2>&1
+[ "$(wc -l < "$WIDE/.gitignore" | tr -d ' ')" = "1" ] \
+  && ok "已被更宽规则挡住时，init 不追加冗余 .gitignore 条目" \
+  || bad "init 往已经挡住的项目里追加了冗余条目" "$(cat "$WIDE/.gitignore")"
+rm -r "$WIDE"
+
 # 非 git 仓库没有 .gitignore 的概念 —— 与 ensure_gitignore 的既有语义对齐，不该报缺口
 cknp=$($BIN/ratchet-init --check --root "$NG" 2>&1)
 echo "$cknp" | grep -qi "缺" \

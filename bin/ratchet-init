@@ -23,6 +23,7 @@ import datetime
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -82,20 +83,45 @@ GITIGNORE_BLOCK = """
 """
 
 
+RUNTIME_PATHS = (".ratchet/state.json", ".ratchet/hits.jsonl",
+                 ".ratchet/log/x", ".ratchet/archive/y")
+
+
 def gitignore_status(root: str) -> str:
-    """只读判定 .gitignore 现状。返回 "n/a"（非 git 仓库）/ "ok" / "missing"。
+    """只读判定运行时数据是否已被版本库忽略。返回 "n/a" / "ok" / "missing"。
 
     抽出来是为了给 --check 用（GitHub #3）：d69117e 之前 init 的老项目没有那 4 条
     条目，运行时数据在版本库里裸奔，而 --check 作为唯一的「现状体检」入口却只字不提，
     用户没有任何契机知道该 --force 一次 —— 版本漂移就这样静默发生。
 
+    **问 git，不要字符串匹配 .gitignore。** v0.1.12 首版用哨兵
+    `".ratchet/hits.jsonl" in cur` 判定，结果在 ratchet 自己的仓上误报 ——
+    本仓 .gitignore 写的是 `.ratchet/`（整个目录），比那 4 条更宽、什么都挡住了，
+    却被判成「缺口」，还建议去追加 4 条完全冗余的条目。
+
+    老的 ensure_gitignore 一直是这个窄哨兵，但它只用于写入判幂等，误判仅导致
+    冗余追加、看不见；搬进 --check 就变成了用户可见的假警报。
+    git check-ignore 是权威判据：它认 `.ratchet/` 这类宽规则，也认 negation、
+    全局 gitignore、.git/info/exclude —— 这些是字符串匹配永远追不上的。
+
     严格只读：check 的契约是「只报告现状，不写任何东西」，报告不等于顺手修。
     """
     if not os.path.exists(os.path.join(root, ".git")):
         return "n/a"  # 非 git 仓库没有 .gitignore 的概念，报「缺口」是噪声
-    gi = os.path.join(root, ".gitignore")
-    cur = open(gi, encoding="utf-8").read() if os.path.isfile(gi) else ""
-    return "ok" if ".ratchet/hits.jsonl" in cur else "missing"
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "check-ignore", "--stdin"],
+            input="\n".join(RUNTIME_PATHS), capture_output=True, text=True, timeout=5)
+        # 逐条都被忽略才算 ok。check-ignore 只回显被忽略的路径，数得上就行。
+        if len(r.stdout.split()) == len(RUNTIME_PATHS):
+            return "ok"
+        return "missing"
+    except (OSError, subprocess.SubprocessError):
+        # 没有 git 可执行文件 / 超时 —— 退回窄哨兵。宁可偶尔多报一次缺口，
+        # 也不要因为判不出来就沉默（沉默正是 #3 抱怨的那个假信号）。
+        gi = os.path.join(root, ".gitignore")
+        cur = open(gi, encoding="utf-8").read() if os.path.isfile(gi) else ""
+        return "ok" if ".ratchet/hits.jsonl" in cur else "missing"
 
 
 def ensure_gitignore(root: str) -> bool:
