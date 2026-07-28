@@ -24,8 +24,11 @@ description: 生成会话交接文件，为主动的上下文重置做准备。�
 ### 1. 生成机械部分
 
 ```bash
-ratchet-digest --transcript <transcript_path> --session <N>
+ratchet-digest --transcript <transcript_path> --session <N> --out
 ```
+
+`--out` 直接落盘到 `.ratchet/log/{今天}-s{N}.md`。**不要自己重定向命名** —— 命名由机制决定，
+手工起名会造出 `s-1.md` 这种与 hook 约定分叉的文件（真踩过）。不带 `--out` 只渲染到 stdout。
 
 这会自动抽出：改了哪些文件、跑了哪些关键命令、工具调用统计、token 消耗、上下文占比。**不要手写这些**——它们在 transcript 里已经有了，誊写一遍是浪费推理算力。
 

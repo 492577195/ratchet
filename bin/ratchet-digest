@@ -10,10 +10,14 @@ ratchet-digest — 从 transcript 自动生成 session 日志的「机械部分�
 模型只写机器写不出来的那一段 —— 决策与教训 —— 硬上限 1 KB。
 
 用法:
-  ratchet-digest --transcript <path> [--session N]
-  echo '<hook payload>' | ratchet-digest        # 从 hook stdin 读
+  ratchet-digest --transcript <path> [--session N]         # 渲染到 stdout
+  ratchet-digest --transcript <path> --session N --out     # 落盘到 .ratchet/log/
+  echo '<hook payload>' | ratchet-digest --hook            # SessionEnd hook 通路
 
-输出: markdown，写入 track/<日期>/session-N.md 的前半部分。
+落盘命名恒为 .ratchet/log/{YYYY-MM-DD}-s{N}.md，hook 与 --out 共用同一套 ——
+命名权在机制手里，调用方无从干预（GitHub #4：手动重定向曾造出无日期前缀的
+s-1.md，与 hook 的约定分叉；`--out` 是开关不是路径，就是为了不留这个口子）。
+不带 --out 时只渲染到 stdout，由调用方处置。
 """
 import argparse
 import datetime
@@ -289,6 +293,9 @@ def main() -> int:
     ap.add_argument("--transcript")
     ap.add_argument("--session", type=int)
     ap.add_argument("--hook", action="store_true")
+    # 开关，不接路径 —— 命名权不下放。见模块 docstring 与 GitHub #4。
+    ap.add_argument("--out", action="store_true",
+                    help="落盘到 .ratchet/log/{today}-s{N}.md，而不是渲染到 stdout")
     ap.add_argument("--root", default=os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     a = ap.parse_args()
 
@@ -316,7 +323,43 @@ def main() -> int:
         return 1
 
     d = transcript.parse(path)
-    sys.stdout.write(render(d, a.session, a.root, os.path.basename(path)))
+    body = render(d, a.session, a.root, os.path.basename(path))
+
+    if not a.out:
+        sys.stdout.write(body)
+        return 0
+
+    # 落盘：命名恒为 {today}-s{N}.md，与 hook 同一套。调用方给不了文件名。
+    n = a.session
+    if n is None:
+        st_p = os.path.join(a.root, ".ratchet", "state.json")
+        try:
+            n = int((json.load(open(st_p, encoding="utf-8")).get("session") or {}).get("last") or 0)
+        except Exception:
+            n = 0
+        if not n:
+            print("ratchet-digest: --out 需要会话编号 —— 给 --session N，"
+                  "或先让 state.json 的 session.last 有值", file=sys.stderr)
+            return 1
+
+    logdir = os.path.join(a.root, ".ratchet", "log")
+    try:
+        ensure_dir(logdir)
+    except PathConflict as e:
+        print(f"ratchet-digest: {e}", file=sys.stderr)
+        return 1
+
+    fp = os.path.join(logdir, f"{datetime.date.today().isoformat()}-s{n}.md")
+    if os.path.exists(fp):
+        # 留痕只增不抹 —— 覆盖是数据丢失，不是「更新」
+        print(f"ratchet-digest: {fp} 已存在，不覆盖。\n"
+              f"  要另起一篇：换 --session 编号\n"
+              f"  要接着写：直接编辑该文件（决策段本来就该手写）", file=sys.stderr)
+        return 1
+
+    with open(fp, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    print(f"已写入 {os.path.relpath(fp, a.root)}")
     return 0
 
 

@@ -856,6 +856,64 @@ rm -r "$PC" "$PD" "$PE"
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "DIGEST·落盘 · 命名由机制决定，文档不许与代码分叉"
+# ─────────────────────────────────────────────────────────────
+# 溯源：GitHub #4。CLI digest 只 render 到 stdout，落盘命名全靠调用方重定向，
+# 而 skills/handoff/SKILL.md 给的正是那条不带落盘参数的命令 —— 于是野外出现
+# 无日期前缀的 s-1.md，与 hook 的 {today}-s{n}.md 分叉。
+# 分叉只发生在手动路径，所以修手动路径：--out 开关不接文件名，命名权收归机制。
+grep -q "track/" bin/ratchet-digest \
+  && bad "docstring 仍写 track/ 旧路径 —— 96298c7 时代遗物，会误导维护者与 AI" \
+  || ok "digest 无 track/ 旧路径残留（文档与代码不分叉）"
+
+DO=$(mktemp -d); $BIN/ratchet-init --preset standard --root "$DO" >/dev/null 2>&1
+TODAY=$(date +%F)
+$BIN/ratchet-digest --transcript "$TMP/cmd.jsonl" --session 4 --out --root "$DO" >/dev/null 2>&1
+[ -f "$DO/.ratchet/log/${TODAY}-s4.md" ] \
+  && ok "--out 落盘到 .ratchet/log/{today}-s{N}.md（与 hook 同一命名）" \
+  || bad "--out 未按约定命名落盘" "$(ls "$DO/.ratchet/log/" 2>&1)"
+
+# 留痕不能被抹：已存在则拒绝覆盖，且要说清楚。
+# 前置守卫不可省 —— 文件不存在时 shasum 两边都空、rc 也非零，这条会为了
+# 完全错误的原因变绿（写这段时真的先绿了一次，那时 --out 还不存在）。
+if [ ! -f "$DO/.ratchet/log/${TODAY}-s4.md" ]; then
+  bad "覆盖断言无法执行：--out 根本没落盘"
+else
+  echo "手写的决策段" >> "$DO/.ratchet/log/${TODAY}-s4.md"   # 模拟用户已补写
+  before=$(shasum "$DO/.ratchet/log/${TODAY}-s4.md" | cut -d' ' -f1)
+  ovout=$($BIN/ratchet-digest --transcript "$TMP/cmd.jsonl" --session 4 --out --root "$DO" 2>&1); ovrc=$?
+  after=$(shasum "$DO/.ratchet/log/${TODAY}-s4.md" | cut -d' ' -f1)
+  [ "$before" = "$after" ] && [ "$ovrc" -ne 0 ] \
+    && ok "--out 拒绝覆盖已有留痕（rc=${ovrc}，手写内容未被抹）" \
+    || bad "--out 覆盖了已存在的日志 —— 用户手写的决策段没了" "$ovout"
+fi
+
+# --out 是开关不是路径：跟在后面的文件名会被 argparse 当位置参数拒绝，
+# 命名权不下放。断言「那个名字没被落盘」而不是「命令失败」——
+# 后者在 --out 不存在时也成立，区分不出真假。
+$BIN/ratchet-digest --transcript "$TMP/cmd.jsonl" --out s-1.md --root "$DO" >/dev/null 2>&1
+find "$DO" -name "s-1.md" | grep -q . \
+  && bad "--out 接受了自定义文件名 —— 命名自由就是分叉的来源" \
+  || ok "--out 不接受自定义文件名（开关式，命名权在机制）"
+# 反向锁：--out 确实能落盘（上面那条不能只靠「什么都没生成」就算过）
+ls "$DO/.ratchet/log/"*.md >/dev/null 2>&1 \
+  && ok "--out 通路本身有效（反向锁，防上一条空过）" \
+  || bad "--out 什么都没落盘 —— 上一条断言毫无意义"
+
+# stdout 通路必须原样保留 —— handoff 之外还有别的用法，不能因为加了 --out 就改行为
+sout=$($BIN/ratchet-digest --transcript "$TMP/cmd.jsonl" --session 9 --root "$DO" 2>/dev/null)
+echo "$sout" | grep -q "^# s-9" \
+  && ok "不带 --out 时仍只渲染到 stdout（既有通路不变）" \
+  || bad "无 --out 的 stdout 行为被改坏" "$(echo "$sout" | head -3)"
+
+# skill 与机制对齐：handoff 让 AI 跑的命令必须带落盘参数，否则命名自由原样留着
+grep -q -- "--out" skills/handoff/SKILL.md \
+  && ok "handoff skill 使用 --out（AI 不再自行重定向命名）" \
+  || bad "handoff skill 仍给不带 --out 的命令 —— 分叉源头没堵上"
+rm -r "$DO"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "FEEDBACK · 现场问题上报（collect 采集 + lint 脱敏）"
 # ─────────────────────────────────────────────────────────────
 # 溯源：finding 曾靠人手从真实项目搬回本仓（docs/finding-hits-无命令原文.md 就是这么
