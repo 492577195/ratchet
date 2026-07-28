@@ -119,6 +119,43 @@ expect() {  # expect <期望> <命令>
 
 # 不可逆破坏必须拦死
 expect deny "rm -rf /tmp/foo"
+
+# ── rm 的 flag 可以任意拆分重排，一种都不能漏 ──────────────────
+# 溯源：v0.1.12 发版前的真实会话验证抓到的 P0。首版正则要求 r 与 f 落在同一个
+# flag 簇里，于是 7 种语义完全等价的写法直接穿透 —— 实测 `rm -r -f <目录>`
+# 在真实会话里被放行，靶目录连同 canary 一起没了。这个洞从 guard 初版就在，
+# v0.1.10 / v0.1.11 两个已发布版本同样漏。
+# 门禁漏一个姿势，等于这条门禁不存在 —— 攻击面只需要一条路。
+expect deny "rm -fr /tmp/foo"
+expect deny "rm -Rf /tmp/foo"
+expect deny "rm -r -f node_modules"
+expect deny "rm -f -r node_modules"
+expect deny "rm -r -f -v node_modules"
+expect deny "rm -v -r -f node_modules"
+expect deny "rm --recursive --force node_modules"
+expect deny "rm --force --recursive node_modules"
+expect deny "rm -r --force node_modules"
+expect deny "rm --force -r node_modules"
+expect deny "sudo rm -rf --no-preserve-root /"
+expect deny "rm dir -rf"                    # GNU 允许选项在操作数之后
+expect deny "rm -R --force node_modules"    # 大写 R 同样是递归
+
+# 反向锁：修漏拦不许把安全用法一起拦掉。
+# 没有这一栏，把规则改成「命令里出现 rm 就拦」也能让上面全绿 —— 那是另一种坏。
+expect allow "rm -r node_modules"           # 递归但不强制，不在 deny 之列
+expect allow "rm -f stale.lock"             # 强制但不递归
+expect allow "rm a.txt"
+expect allow "rm -i -r build"               # 交互式递归，反而是安全姿势
+expect allow "rm -r -- -f"                  # -- 之后是文件名，删的是名叫 -f 的文件
+expect allow "npm-rf --help"                # rm 不是独立词，不该误命中
+expect allow "rmdir -p a/b/c"               # 压根不是 rm
+
+# 判定必须按「单条命令」切，不能把整行的 flag 混在一起看。
+# 这条最容易写错：天真实现会把 -r 和 -f 分别从两条命令里捡出来凑成 rf。
+expect allow "rm -r a && rm -f b"
+expect deny  "cd /tmp && rm -r -f target"   # 反过来，分隔符后的真 rf 不许漏
+expect deny  "rm --recu --for dir"          # GNU 长选项缩写
+expect deny  "find . -exec rm -rf {} \\;"
 expect deny "git push --force origin main"
 expect deny "git push -f"
 expect deny "git reset --hard HEAD~3"
