@@ -637,6 +637,34 @@ $BIN/ratchet-init --preset standard --root "$NG" >/dev/null 2>&1
 [ -f "$NG/.gitignore" ] && bad "非 git 仓库不该生成 .gitignore" \
   || ok "非 git 仓库不留 .gitignore"
 
+# --check 必须报告 gitignore 缺口。溯源：GitHub #3。
+# d69117e 之前 init 的老项目没有那 4 条条目，运行时数据在版本库里裸奔 ——
+# 而 --check 作为唯一的「现状体检」入口，却给出「一切正常」的假信号，
+# 用户没有任何契机知道该 --force 一次。版本漂移就这样静默发生。
+OLDP=$(mktemp -d); git -C "$OLDP" init -q; mkdir -p "$OLDP/.ratchet"   # 老项目：有 .ratchet/，无 gitignore 条目
+ckout=$($BIN/ratchet-init --check --root "$OLDP" 2>&1)
+echo "$ckout" | grep -qi "gitignore" \
+  && ok "--check 报告 .gitignore 缺口（老项目升级的唯一信号）" \
+  || bad "--check 对 gitignore 缺口只字不提 —— 老项目运行时数据继续裸奔" "$ckout"
+echo "$ckout" | grep -q -- "--force" \
+  && ok "--check 缺口提示给出可复制的修复命令" \
+  || bad "--check 报了缺口却没指路" "$ckout"
+# check 的契约是只读（docstring 自述「只报告现状，不写任何东西」），报告不等于顺手修
+[ -f "$OLDP/.gitignore" ] \
+  && bad "--check 擅自写了 .gitignore —— 破坏「只读报告」契约" \
+  || ok "--check 只报告不写入（只读契约不破）"
+# 跑过真 init 的项目：--check 该说就绪，不能反过来虚报缺口
+ckok=$($BIN/ratchet-init --check --root "$GI" 2>&1)
+echo "$ckok" | grep -qi "缺" \
+  && bad "已就绪的项目被 --check 误报缺口" "$ckok" \
+  || ok "--check 对已就绪项目不虚报缺口"
+# 非 git 仓库没有 .gitignore 的概念 —— 与 ensure_gitignore 的既有语义对齐，不该报缺口
+cknp=$($BIN/ratchet-init --check --root "$NG" 2>&1)
+echo "$cknp" | grep -qi "缺" \
+  && bad "非 git 仓库被误报 gitignore 缺口（凭空生成才是噪声）" "$cknp" \
+  || ok "非 git 仓库不报 gitignore 缺口"
+rm -r "$OLDP"
+
 # 回归 · 热区 = 真正会进上下文的东西，不是「所有机制文件」。
 # .ratchet/constitution.md 不进上下文（AI 读 CLAUDE.md → @AGENTS.md，正文已在 AGENTS.md 里），
 # 它只是 plugin 产物副本，供 upgrade 做 diff。首版把它算进热区 → 同一份内容计两遍、

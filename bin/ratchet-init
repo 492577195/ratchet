@@ -82,18 +82,32 @@ GITIGNORE_BLOCK = """
 """
 
 
+def gitignore_status(root: str) -> str:
+    """只读判定 .gitignore 现状。返回 "n/a"（非 git 仓库）/ "ok" / "missing"。
+
+    抽出来是为了给 --check 用（GitHub #3）：d69117e 之前 init 的老项目没有那 4 条
+    条目，运行时数据在版本库里裸奔，而 --check 作为唯一的「现状体检」入口却只字不提，
+    用户没有任何契机知道该 --force 一次 —— 版本漂移就这样静默发生。
+
+    严格只读：check 的契约是「只报告现状，不写任何东西」，报告不等于顺手修。
+    """
+    if not os.path.exists(os.path.join(root, ".git")):
+        return "n/a"  # 非 git 仓库没有 .gitignore 的概念，报「缺口」是噪声
+    gi = os.path.join(root, ".gitignore")
+    cur = open(gi, encoding="utf-8").read() if os.path.isfile(gi) else ""
+    return "ok" if ".ratchet/hits.jsonl" in cur else "missing"
+
+
 def ensure_gitignore(root: str) -> bool:
     """把运行时数据挡在版本库外。幂等；非 git 仓库不留痕。
 
     返回 True 表示这次真的写了。
     """
-    if not os.path.exists(os.path.join(root, ".git")):
-        return False  # 不是 git 仓库，凭空生成 .gitignore 是噪声
+    if gitignore_status(root) != "missing":
+        return False  # 非 git 仓库，或条目已在 —— 两种都不写
 
     gi = os.path.join(root, ".gitignore")
     cur = open(gi, encoding="utf-8").read() if os.path.isfile(gi) else ""
-    if ".ratchet/hits.jsonl" in cur:
-        return False  # 已有，不重复追加
 
     sep = "" if (not cur or cur.endswith("\n")) else "\n"
     with open(gi, "a", encoding="utf-8") as fh:
@@ -117,13 +131,23 @@ def main() -> int:
     if a.check:
         print(f"项目: {root}")
         print(f".ratchet/     {'已存在' if os.path.isdir(rd) else '未初始化'}")
+        preset = None
         if os.path.isfile(state_p):
             try:
                 st = json.load(open(state_p, encoding="utf-8"))
-                print(f"档位:         {st.get('preset')}")
+                preset = st.get("preset")
+                print(f"档位:         {preset}")
                 print(f"会话数:       {(st.get('session') or {}).get('last', 0)}")
             except Exception as e:
                 print(f"state.json 损坏: {e}")
+        gs = gitignore_status(root)
+        if gs == "ok":
+            print(".gitignore:   运行时数据已挡在版本库外")
+        elif gs == "missing":
+            # 老项目升级的唯一信号 —— 提示必须自带出口，否则等于没提示
+            print(".gitignore:   ⚠️ 缺 ratchet 运行时条目 —— state/hits/log/archive 正在版本库里裸奔")
+            print(f"              补齐：ratchet-init --preset {preset or '<standard|complex>'} --force"
+                  "（只覆写 plugin 产物，不动 state 与 log）")
         return 0
 
     if not a.preset:
