@@ -52,7 +52,8 @@ git config core.hooksPath .githooks    # 克隆后跑一次，装上 pre-push
 
 1. 跑 `test/run.sh` —— 不绿就拒绝，**任何分支，无例外**
 2. 推 `main` 时追加发布检查：
-   - 版本号三处一致（`VERSION` / `.claude-plugin/plugin.json` / `.codex-plugin/plugin.json`）
+   - 版本号**四处**一致（`VERSION` / `.claude-plugin/plugin.json` / `.codex-plugin/plugin.json` /
+     `.claude-plugin/marketplace.json` 的顶层 `version` 与 `metadata.version`）
    - **版本号必须比最新 tag 新**
    - 宪法 ≤ 4 KB
 
@@ -73,10 +74,12 @@ git config core.hooksPath .githooks    # 克隆后跑一次，装上 pre-push
 git checkout dev
 ./test/run.sh
 
-# 2. bump 版本（三处必须一致）
-vim VERSION                        # 0.2.0
-vim .claude-plugin/plugin.json     # "version": "0.2.0"
-vim .codex-plugin/plugin.json      # "version": "0.2.0"
+# 2. bump 版本（四处必须一致 —— marketplace.json 有两个字段，别漏）
+vim VERSION                          # 0.2.0
+vim .claude-plugin/plugin.json       # "version": "0.2.0"
+vim .codex-plugin/plugin.json        # "version": "0.2.0"
+vim .claude-plugin/marketplace.json  # 顶层 version 与 metadata.version 都要改
+./test/run.sh                        # 有断言校验四处一致，别等推 main 才被拦
 git commit -am "[RELEASE] v0.2.0"
 
 # 3. 合到 main

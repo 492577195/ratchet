@@ -514,6 +514,22 @@ done)
 [ -z "$badfm" ] && ok "所有 SKILL.md frontmatter 仅 name/description（Codex 兼容）" \
   || bad "以下 skill 含 Codex 不认的字段" "$badfm"
 
+# 版本号四处一致。溯源：v0.1.12 发版时只 bump 了三处 —— RELEASING.md 写的就是
+# 「三处」，而 pre-push 实际查四处（marketplace.json 还有两个字段）。文档与门禁
+# 自己分叉了，于是推 main 被拦在最后一步。marketplace.json 更早还掉队到 0.1.0
+# 无人发现（v0.1.10 时代 dogfood 抓到）—— 同一个地方栽两次。
+# 放进测试而不是只靠 pre-push：推 main 才被拦太晚，bump 完跑一次测试就该知道。
+vers=$(python3 -c "
+import json
+v = [open('VERSION').read().strip()]
+for p in ('.claude-plugin/plugin.json', '.codex-plugin/plugin.json'):
+    v.append(json.load(open(p))['version'])
+m = json.load(open('.claude-plugin/marketplace.json'))
+v += [m['version'], m['metadata']['version']]
+print(' '.join(v) if len(set(v)) > 1 else 'ok')")
+[ "$vers" = "ok" ] && ok "版本号四处一致（VERSION/claude/codex/marketplace×2）" \
+  || bad "版本号不一致 —— Codex cache 按版本号分目录，不 bump 就拿不到新代码且无报错" "$vers"
+
 # 宪法 4 KB 硬上限 —— 一份没人读完的宪法等于没有宪法
 cn=$(wc -c < templates/constitution.md | tr -d ' ')
 [ "$cn" -le 4096 ] && ok "宪法 ${cn} B ≤ 4096 B（原工程 CLAUDE.md 是 13,183 B）" \
