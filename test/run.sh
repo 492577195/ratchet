@@ -759,6 +759,75 @@ sys.exit(0 if not d or (h.get('hookEventName') == 'SessionStart' and 'additional
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "PATHCONFLICT · .ratchet/log 不是目录时：人话报错，且失败不许静默"
+# ─────────────────────────────────────────────────────────────
+# 溯源：GitHub #2（trellis-suite 现场）。`.ratchet/log` 一度是普通文件，于是：
+#   · init   —— 裸 makedirs 抛 FileExistsError，新用户第一步就吃一屏 traceback
+#   · digest —— 同样裸调，hook 模式被兜底 except 吞成 `{}`，退出码 0、stderr 空、
+#               hits 无记录 —— 四个通道全静默。用户以为天天在留痕，实际一片空白。
+# 静默比崩溃危险：崩溃会被看见，静默要等到翻历史时才发现。
+# 信号通道选 systemMessage —— SessionEnd 唯一协议合法且用户可见的字段（见上方 UNIVERSAL）。
+# 不写 hits：那是 guard 命中的口径，ratchet-audit 按 rule 与已知规则对账，掺进去是噪声。
+PC=$(mktemp -d); mkdir -p "$PC/.ratchet"; : > "$PC/.ratchet/log"   # log 是普通文件
+
+pcout=$($BIN/ratchet-init --preset standard --root "$PC" 2>&1); pcrc=$?
+[ "$pcrc" -ne 0 ] && ok "init 路径冲突时退出非零（rc=${pcrc}）" \
+  || bad "init 路径冲突却报成功 —— 骨架没铺全，用户无感知"
+echo "$pcout" | grep -q "Traceback" \
+  && bad "init 吐了 traceback —— 脚手架最该稳的时刻甩给用户一屏栈" "$pcout" \
+  || ok "init 不吐 traceback"
+echo "$pcout" | grep -q ".ratchet/log" \
+  && ok "init 报错点名了冲突路径（用户能直接照着处理）" \
+  || bad "init 报错没说是哪个路径冲突" "$pcout"
+[ -f "$PC/.ratchet/log" ] \
+  && ok "init 没动用户的文件（那是用户数据，只报错不代劳）" \
+  || bad "init 擅自删改了冲突路径 —— 绝不允许"
+
+# digest hook：不许崩会话（rc=0 + 合法 JSON），但也不许静默。
+# 夹具必须是「init 成功后 log 才被破坏」的项目 —— 否则 run_hook 在
+# `not isfile(state.json)` 那一步就判成非 ratchet 项目早退，`{}` 与路径冲突无关，
+# 断言会为了错误的原因变绿。（本条注释是实测踩出来的：第一版夹具正是这么写错的。）
+PD=$(mktemp -d)
+$BIN/ratchet-init --preset standard --root "$PD" >/dev/null 2>&1
+rm -r "$PD/.ratchet/log"; : > "$PD/.ratchet/log"
+dgerr="$PD/dg.err"
+pcdg=$(printf '{"cwd":"%s","transcript_path":"%s"}' "$PD" "$TMP/cmd.jsonl" \
+       | $BIN/ratchet-digest --hook 2>"$dgerr"); dgrc=$?
+[ "$dgrc" -eq 0 ] && ok "digest hook 路径冲突时仍 rc=0（留痕失败不该把会话搞崩）" \
+  || bad "digest hook 退出码 ${dgrc} —— 会话被留痕故障拖崩"
+echo "$pcdg" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+allowed = set('$UNIVERSAL'.split())
+sys.exit(0 if set(d) <= allowed else 1)" 2>/dev/null \
+  && ok "digest 失败输出仍只含 universal 字段（协议不能因为出错就破)" \
+  || bad "digest 失败输出违反 SessionEnd 协议" "$pcdg"
+echo "$pcdg" | python3 -c "
+import json, sys
+sys.exit(0 if (json.load(sys.stdin).get('systemMessage') or '').strip() else 1)" 2>/dev/null \
+  && ok "digest 失败时 systemMessage 给出可见信号（不再静默吞成 {}）" \
+  || bad "digest 留痕失败却静默 —— 用户以为在留痕，实际什么都没写" "$pcdg"
+[ -s "$dgerr" ] && ok "digest 失败同时写了 stderr（CLI/调试可见）" \
+  || bad "digest 失败 stderr 为空"
+
+# 对照：同一份 transcript 在正常 log 目录下必须真落盘。
+# 没有这条，上面几条可能因为「压根没走到 makedirs」而假绿。
+PE=$(mktemp -d); $BIN/ratchet-init --preset standard --root "$PE" >/dev/null 2>&1
+printf '{"cwd":"%s","transcript_path":"%s"}' "$PE" "$TMP/cmd.jsonl" \
+  | $BIN/ratchet-digest --hook >/dev/null 2>&1
+ls "$PE/.ratchet/log/"*.md >/dev/null 2>&1 \
+  && ok "对照组：log 为正常目录时同一夹具真落盘（证明上面测的确实是冲突路径）" \
+  || bad "对照组没落盘 —— 上面的失败断言可能测错了代码路径"
+
+# 校验器：堵死同类错。裸 os.makedirs 的 exist_ok 只对「已是目录」豁免，
+# 剩下的情况一律 FileExistsError。全仓只准走 lib/paths.py 的 ensure_dir。
+bare=$(grep -rn "os\.makedirs" bin/ 2>/dev/null || true)
+[ -z "$bare" ] && ok "bin/ 无裸 os.makedirs（目录落地统一走 ensure_dir）" \
+  || bad "bin/ 出现裸 os.makedirs —— 路径冲突会再次抛 traceback" "$bare"
+rm -r "$PC" "$PD" "$PE"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "FEEDBACK · 现场问题上报（collect 采集 + lint 脱敏）"
 # ─────────────────────────────────────────────────────────────
 # 溯源：finding 曾靠人手从真实项目搬回本仓（docs/finding-hits-无命令原文.md 就是这么

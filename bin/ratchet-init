@@ -28,6 +28,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES = os.path.join(HERE, "..", "templates")
 
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+from paths import PathConflict, ensure_dir  # noqa: E402
+
 CLAUDE_MD = """# 项目说明
 
 <!-- 纪律基线由 ratchet 维护，唯一真源是 AGENTS.md。
@@ -134,9 +137,13 @@ def main() -> int:
         )
 
     # ── 目录 ────────────────────────────────────────────────
-    os.makedirs(os.path.join(rd, "rules"), exist_ok=True)
-    os.makedirs(os.path.join(rd, "log"), exist_ok=True)
-    os.makedirs(os.path.join(rd, "archive"), exist_ok=True)
+    # 走 ensure_dir 而非裸 makedirs：路径被普通文件/悬空软链占住时，
+    # 用户该看到的是人话和处置建议，不是一屏 traceback（GitHub #2）。
+    try:
+        for sub in ("rules", "log", "archive"):
+            ensure_dir(os.path.join(rd, sub))
+    except PathConflict as e:
+        return die(str(e))
 
     # ── plugin 产物：可覆写 ─────────────────────────────────
     src = os.path.join(TEMPLATES, "constitution.md")

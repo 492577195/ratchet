@@ -24,6 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 import transcript  # noqa: E402
+from paths import PathConflict, ensure_dir  # noqa: E402
 
 # 噪声：查看类命令，日志不需要（日志要的是「做了什么」，不是终端回放）
 _NOISE = re.compile(r"^(ls|cat|head|tail|pwd|echo|wc|find|grep|which|printf|chmod|cd)\b|^git (status|log|diff|show)\b")
@@ -154,6 +155,30 @@ def _find_by_transcript(logdir: str, tid: str) -> str:
     return ""
 
 
+def fail_visibly(msg: str) -> int:
+    """留痕失败时的唯一出口：不崩会话（rc=0），但绝不静默。
+
+    溯源：GitHub #2。原先 hook 模式的兜底 `except Exception: print("{}")` 把一切
+    异常吞成空对象 —— 退出码 0、stdout 干净、stderr 空。用户以为天天在留痕，
+    实际什么都没写，等需要翻历史时才发现一片空白。
+
+    「不能把会话搞崩」的初衷是对的，代价却选错了：崩溃会被看见，静默不会。
+    所以保留 rc=0，改为两路发信号：
+      · systemMessage —— SessionEnd 协议允许的 universal 字段，用户当场可见
+                          （依据 https://code.claude.com/docs/en/hooks；也是本脚本
+                           成功路径一直在用的同一个字段）
+      · stderr        —— CLI/调试可见，兜 systemMessage 被平台折叠的情况
+
+    不写 hits.jsonl：那是 guard 命中的口径，ratchet-audit 按 rule 与已知规则对账，
+    掺进非 guard 记录会污染减法审计。
+    """
+    print(f"ratchet-digest: {msg}", file=sys.stderr)
+    json.dump({"systemMessage": f"[ratchet] 留痕失败 —— {msg}"},
+              sys.stdout, ensure_ascii=False)
+    print()
+    return 0
+
+
 def run_hook(payload: dict) -> int:
     """SessionEnd：把机械事实落盘，并标记『决策段待补』。
 
@@ -200,7 +225,10 @@ def run_hook(payload: dict) -> int:
             print()
             return 0
 
-    os.makedirs(logdir, exist_ok=True)
+    try:
+        ensure_dir(logdir)
+    except PathConflict as e:
+        return fail_visibly(str(e))
     today = datetime.date.today().isoformat()
 
     # 首版的 bug：n 无脑取 last+1，然后 `if not exists(fp)` 静默跳过写入，
@@ -272,9 +300,10 @@ def main() -> int:
             return 0
         try:
             return run_hook(payload)
-        except Exception:
-            print("{}")  # 留痕失败绝不能把会话搞崩
-            return 0
+        except Exception as e:
+            # 留痕失败绝不能把会话搞崩 —— 但也绝不能悄无声息（GitHub #2）。
+            # rc 仍是 0，信号走 fail_visibly 的 systemMessage + stderr 两路。
+            return fail_visibly(f"{e.__class__.__name__}: {e}")
 
     path = a.transcript
     if not path and not sys.stdin.isatty():
