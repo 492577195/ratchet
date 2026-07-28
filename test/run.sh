@@ -6,6 +6,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 BIN=./bin
+ROOT=$(pwd)   # 绝对路径：有些断言要 cd 进沙箱跑，相对 BIN 在那里就失效了
 PASS=0; FAIL=0
 ok()   { printf "  ✅ %s\n" "$1"; PASS=$((PASS+1)); }
 bad()  { printf "  ❌ %s\n     %s\n" "$1" "${2:-}"; FAIL=$((FAIL+1)); }
@@ -61,13 +62,23 @@ with open(sys.argv[1], "w") as f:
             "cache_read_input_tokens": 310_000, "cache_creation_input_tokens": 900},
         "content": []}}) + "\n")
 PY
-line=$($BIN/ratchet-context --transcript "$TMP/big.jsonl")
+# 必须在**没有** .ratchet/config.json 的目录里跑 —— ratchet-context 靠 cwd 读配置，
+# 在本仓根目录跑就会读到本仓自己的 config。
+# 溯源：给 ratchet 自己的仓补上 state/config（让它吃自己的狗粮）之后，这条立刻变红：
+# 读到 context_window=200000，如实算出 156%，于是断言判定「首版 bug 复发」。
+# 代码没问题，是断言把「无配置」当成了假设而不是保证 —— 一条结果取决于开发者
+# 本地仓库状态的测试，绿不绿全看运气。沙箱化，把前提变成保证。
+line=$(cd "$TMP" && "$ROOT/bin/ratchet-context" --transcript "$TMP/big.jsonl")
 pct=$(printf '%s' "$line" | sed -E 's/.*ctx ([0-9]+)%.*/\1/')
 if [ -n "$pct" ] && [ "$pct" -le 100 ]; then
   ok "无配置时兜底升档，占比 ${pct}% ≤ 100% ($line)"
 else
   bad "占比 >100%（首版 bug 复发）" "$line"
 fi
+# 反向锁：确认沙箱真的没有配置 —— 否则上面那条可能因为读到别的配置而假绿
+[ -e "$TMP/.ratchet/config.json" ] \
+  && bad "沙箱里竟有 config.json —— 上面的「无配置」断言前提不成立" \
+  || ok "兜底断言跑在无配置沙箱里（前提是保证，不是假设）"
 # 显式配置窗口时必须如实采用
 line=$($BIN/ratchet-context --transcript "$TMP/big.jsonl" --window 1000000)
 echo "$line" | grep -q "1000k" && ok "显式 --window 生效 ($line)" || bad "显式 --window 未生效" "$line"
