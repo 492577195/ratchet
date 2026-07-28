@@ -112,8 +112,12 @@ def render(st, state_path=None):
 
     sess = st.get("session") or {}
     tail = []
-    if sess.get("log_written") is False:
-        tail.append(f"⚠️ 上次会话（s-{sess.get('last', '?')}）的日志未写，先补写再开新工作。")
+    # 消解过的不再顶行。只认「消解号 == 当前会话号」—— 新会话落草稿后 last 前进，
+    # 提醒自动回来，所以这是退路不是消音器（GitHub #5）。
+    # 缺 log_dismissed 的老 state 一律视为未消解。
+    if sess.get("log_written") is False and sess.get("log_dismissed") != sess.get("last"):
+        tail.append(f"⚠️ 上次会话（s-{sess.get('last', '?')}）的日志未写 "
+                    "→ 补写，或 ratchet-audit --ack-log 驳回")
     if state_path:
         hl = hits_line(pending_hits(state_path))
         if hl:

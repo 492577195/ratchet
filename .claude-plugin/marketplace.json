@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "AI 协作工程脚手架",
-    "version": "0.1.11"
+    "version": "0.1.12"
   },
   "plugins": [
     {
@@ -23,5 +23,5 @@
       "strict": false
     }
   ],
-  "version": "0.1.11"
+  "version": "0.1.12"
 }

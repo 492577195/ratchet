@@ -119,6 +119,43 @@ expect() {  # expect <期望> <命令>
 
 # 不可逆破坏必须拦死
 expect deny "rm -rf /tmp/foo"
+
+# ── rm 的 flag 可以任意拆分重排，一种都不能漏 ──────────────────
+# 溯源：v0.1.12 发版前的真实会话验证抓到的 P0。首版正则要求 r 与 f 落在同一个
+# flag 簇里，于是 7 种语义完全等价的写法直接穿透 —— 实测 `rm -r -f <目录>`
+# 在真实会话里被放行，靶目录连同 canary 一起没了。这个洞从 guard 初版就在，
+# v0.1.10 / v0.1.11 两个已发布版本同样漏。
+# 门禁漏一个姿势，等于这条门禁不存在 —— 攻击面只需要一条路。
+expect deny "rm -fr /tmp/foo"
+expect deny "rm -Rf /tmp/foo"
+expect deny "rm -r -f node_modules"
+expect deny "rm -f -r node_modules"
+expect deny "rm -r -f -v node_modules"
+expect deny "rm -v -r -f node_modules"
+expect deny "rm --recursive --force node_modules"
+expect deny "rm --force --recursive node_modules"
+expect deny "rm -r --force node_modules"
+expect deny "rm --force -r node_modules"
+expect deny "sudo rm -rf --no-preserve-root /"
+expect deny "rm dir -rf"                    # GNU 允许选项在操作数之后
+expect deny "rm -R --force node_modules"    # 大写 R 同样是递归
+
+# 反向锁：修漏拦不许把安全用法一起拦掉。
+# 没有这一栏，把规则改成「命令里出现 rm 就拦」也能让上面全绿 —— 那是另一种坏。
+expect allow "rm -r node_modules"           # 递归但不强制，不在 deny 之列
+expect allow "rm -f stale.lock"             # 强制但不递归
+expect allow "rm a.txt"
+expect allow "rm -i -r build"               # 交互式递归，反而是安全姿势
+expect allow "rm -r -- -f"                  # -- 之后是文件名，删的是名叫 -f 的文件
+expect allow "npm-rf --help"                # rm 不是独立词，不该误命中
+expect allow "rmdir -p a/b/c"               # 压根不是 rm
+
+# 判定必须按「单条命令」切，不能把整行的 flag 混在一起看。
+# 这条最容易写错：天真实现会把 -r 和 -f 分别从两条命令里捡出来凑成 rf。
+expect allow "rm -r a && rm -f b"
+expect deny  "cd /tmp && rm -r -f target"   # 反过来，分隔符后的真 rf 不许漏
+expect deny  "rm --recu --for dir"          # GNU 长选项缩写
+expect deny  "find . -exec rm -rf {} \\;"
 expect deny "git push --force origin main"
 expect deny "git push -f"
 expect deny "git reset --hard HEAD~3"
@@ -477,6 +514,22 @@ done)
 [ -z "$badfm" ] && ok "所有 SKILL.md frontmatter 仅 name/description（Codex 兼容）" \
   || bad "以下 skill 含 Codex 不认的字段" "$badfm"
 
+# 版本号四处一致。溯源：v0.1.12 发版时只 bump 了三处 —— RELEASING.md 写的就是
+# 「三处」，而 pre-push 实际查四处（marketplace.json 还有两个字段）。文档与门禁
+# 自己分叉了，于是推 main 被拦在最后一步。marketplace.json 更早还掉队到 0.1.0
+# 无人发现（v0.1.10 时代 dogfood 抓到）—— 同一个地方栽两次。
+# 放进测试而不是只靠 pre-push：推 main 才被拦太晚，bump 完跑一次测试就该知道。
+vers=$(python3 -c "
+import json
+v = [open('VERSION').read().strip()]
+for p in ('.claude-plugin/plugin.json', '.codex-plugin/plugin.json'):
+    v.append(json.load(open(p))['version'])
+m = json.load(open('.claude-plugin/marketplace.json'))
+v += [m['version'], m['metadata']['version']]
+print(' '.join(v) if len(set(v)) > 1 else 'ok')")
+[ "$vers" = "ok" ] && ok "版本号四处一致（VERSION/claude/codex/marketplace×2）" \
+  || bad "版本号不一致 —— Codex cache 按版本号分目录，不 bump 就拿不到新代码且无报错" "$vers"
+
 # 宪法 4 KB 硬上限 —— 一份没人读完的宪法等于没有宪法
 cn=$(wc -c < templates/constitution.md | tr -d ' ')
 [ "$cn" -le 4096 ] && ok "宪法 ${cn} B ≤ 4096 B（原工程 CLAUDE.md 是 13,183 B）" \
@@ -609,6 +662,56 @@ with open('$WB/.ratchet/hits.jsonl','w') as f:
 n=$($BIN/ratchet-brief --state "$WB/.ratchet/state.json" | wc -c | tr -d ' ')
 [ "$n" -le 2048 ] && ok "最坏 state + 20 种未处理命中仍 ${n} B ≤ 2048 B（K1 未被提示挤爆）" \
   || bad "提示挤爆了 K1 预算：${n} B > 2048 B"
+
+# ── 日志提醒同样要有退路 ──────────────────────────────────────
+# 溯源：GitHub #5。digest 落草稿后置 log_written=false，全仓无任何代码置回 true，
+# 回写靠 handoff 让人/AI 手改 state —— 这是有意设计。但对照 hits：命中提示有
+# --ack 消解（看过并判定不值得写规则也是正当结论），日志提醒没有等价物。
+# 用户一旦决定「这篇不补」，唯一的消解法是撒谎（手改 false→true）或学会无视。
+# 两种都腐蚀机制可信度 —— 提示必须自带出口，这条判据上面 hits 段已经写过一遍了。
+LW=$(mktemp -d); $BIN/ratchet-init --preset standard --root "$LW" >/dev/null 2>&1
+LWS="$LW/.ratchet/state.json"
+python3 -c "
+import json; p='$LWS'; d=json.load(open(p))
+d['session']={'last':3,'last_date':'2026-07-21','log_written':False}
+json.dump(d,open(p,'w'),ensure_ascii=False)"
+$BIN/ratchet-brief --state "$LWS" | grep -q "日志未写" \
+  && ok "log_written=false 时起手顶出日志提醒" \
+  || bad "日志提醒没出现 —— 夹具或判据错了"
+$BIN/ratchet-brief --state "$LWS" | grep -q -- "--ack-log" \
+  && ok "日志提醒自带消解命令（与 hits 提示同款：提示必须给出口）" \
+  || bad "日志提醒没给退路 —— 用户只能撒谎或学会无视"
+
+$BIN/ratchet-audit --root "$LW" --ack-log >/dev/null 2>&1
+$BIN/ratchet-brief --state "$LWS" | grep -q "日志未写" \
+  && bad "--ack-log 后提醒仍在 —— 退路无效" \
+  || ok "--ack-log 后日志提醒消失"
+$BIN/ratchet-state --state "$LWS" >/dev/null 2>&1 \
+  && ok "--ack-log 写回的 state 仍通过 schema 校验" \
+  || bad "--ack-log 写出了非法 state —— schema 没同步"
+# 重复消解不该再报一次「已消解」—— log_written 仍是 false，天真实现会重复动作
+$BIN/ratchet-audit --root "$LW" --ack-log 2>&1 | grep -q "已经消解过" \
+  && ok "重复 --ack-log 如实说「已消解过」而非再报一次成功" \
+  || bad "重复 --ack-log 谎报了一次新消解"
+
+# 消解不是永久消音：新会话再落草稿，提醒必须重新生效
+python3 -c "
+import json; p='$LWS'; d=json.load(open(p))
+d['session']['last']=4; d['session']['log_written']=False
+json.dump(d,open(p,'w'),ensure_ascii=False)"
+$BIN/ratchet-brief --state "$LWS" | grep -q "日志未写" \
+  && ok "消解后新会话的日志提醒重新出现（不是永久消音）" \
+  || bad "消解把后续所有提醒都关掉了 —— 那是消音器不是退路"
+
+# 向后兼容：老 state 没有消解字段，必须视为「未消解」
+python3 -c "
+import json; p='$LWS'; d=json.load(open(p))
+d['session']={'last':5,'log_written':False}   # 干净的老格式，无消解标记
+json.dump(d,open(p,'w'),ensure_ascii=False)"
+$BIN/ratchet-brief --state "$LWS" | grep -q "日志未写" \
+  && ok "无消解字段的老 state 视为未消解（向后兼容）" \
+  || bad "老 state 被当成已消解 —— 存量提醒被静默吞掉"
+rm -r "$LW"
 rm -r "$WB"
 
 # init 必须把运行时数据挡在版本库外。
@@ -637,6 +740,34 @@ $BIN/ratchet-init --preset standard --root "$NG" >/dev/null 2>&1
 [ -f "$NG/.gitignore" ] && bad "非 git 仓库不该生成 .gitignore" \
   || ok "非 git 仓库不留 .gitignore"
 
+# --check 必须报告 gitignore 缺口。溯源：GitHub #3。
+# d69117e 之前 init 的老项目没有那 4 条条目，运行时数据在版本库里裸奔 ——
+# 而 --check 作为唯一的「现状体检」入口，却给出「一切正常」的假信号，
+# 用户没有任何契机知道该 --force 一次。版本漂移就这样静默发生。
+OLDP=$(mktemp -d); git -C "$OLDP" init -q; mkdir -p "$OLDP/.ratchet"   # 老项目：有 .ratchet/，无 gitignore 条目
+ckout=$($BIN/ratchet-init --check --root "$OLDP" 2>&1)
+echo "$ckout" | grep -qi "gitignore" \
+  && ok "--check 报告 .gitignore 缺口（老项目升级的唯一信号）" \
+  || bad "--check 对 gitignore 缺口只字不提 —— 老项目运行时数据继续裸奔" "$ckout"
+echo "$ckout" | grep -q -- "--force" \
+  && ok "--check 缺口提示给出可复制的修复命令" \
+  || bad "--check 报了缺口却没指路" "$ckout"
+# check 的契约是只读（docstring 自述「只报告现状，不写任何东西」），报告不等于顺手修
+[ -f "$OLDP/.gitignore" ] \
+  && bad "--check 擅自写了 .gitignore —— 破坏「只读报告」契约" \
+  || ok "--check 只报告不写入（只读契约不破）"
+# 跑过真 init 的项目：--check 该说就绪，不能反过来虚报缺口
+ckok=$($BIN/ratchet-init --check --root "$GI" 2>&1)
+echo "$ckok" | grep -qi "缺" \
+  && bad "已就绪的项目被 --check 误报缺口" "$ckok" \
+  || ok "--check 对已就绪项目不虚报缺口"
+# 非 git 仓库没有 .gitignore 的概念 —— 与 ensure_gitignore 的既有语义对齐，不该报缺口
+cknp=$($BIN/ratchet-init --check --root "$NG" 2>&1)
+echo "$cknp" | grep -qi "缺" \
+  && bad "非 git 仓库被误报 gitignore 缺口（凭空生成才是噪声）" "$cknp" \
+  || ok "非 git 仓库不报 gitignore 缺口"
+rm -r "$OLDP"
+
 # 回归 · 热区 = 真正会进上下文的东西，不是「所有机制文件」。
 # .ratchet/constitution.md 不进上下文（AI 读 CLAUDE.md → @AGENTS.md，正文已在 AGENTS.md 里），
 # 它只是 plugin 产物副本，供 upgrade 做 diff。首版把它算进热区 → 同一份内容计两遍、
@@ -645,6 +776,32 @@ hotout=$($BIN/ratchet-overhead --root "$PJ" 2>/dev/null)
 echo "$hotout" | sed -n '/热区（/,/冷区/p' | grep -q "constitution.md" \
   && bad "constitution.md 被误算进热区（它不进上下文，会导致重复计数）" \
   || ok "constitution.md 归入冷区（不进上下文，避免与 AGENTS.md 重复计数）"
+
+# 同一条判据的第二次应用：会话日志也不进上下文（GitHub #6）。
+# constitution.md 那次虚报 489 B；日志这次量级大得多 —— 下游实测 12.9 KB / 12.0 KB
+# 报「超标」107%，其中 7.2 KB 全是日志。误报会把用户推去跑 /slim 做无谓减法，
+# 砍掉的可能正是有价值的留痕节奏，且会稀释真实超标的可信度。
+# 论证（本次逐条核实）：hooks.json 只有 4 个 hook；SessionStart 注入的
+# additionalContext 只有 render(state)，不含日志正文；digest 读 log 仅为
+# _find_by_transcript 的指纹去重（脚本内部读盘，不进上下文）；handoff 是
+# skill 被调用时按需读，不是自动加载。没有第五条通路 —— 日志全量归冷区。
+LG=$(mktemp -d); $BIN/ratchet-init --preset standard --root "$LG" >/dev/null 2>&1
+pct0=$($BIN/ratchet-overhead --root "$LG" 2>/dev/null | grep -o '([0-9]*%)' | head -1)
+for i in 1 2 3 4; do
+  head -c 4000 /dev/zero | tr '\0' 'x' > "$LG/.ratchet/log/2026-07-2${i}-s${i}.md"
+done
+lgout=$($BIN/ratchet-overhead --root "$LG" 2>/dev/null)
+echo "$lgout" | sed -n '/热区（/,/冷区/p' | grep -q ".ratchet/log" \
+  && bad "会话日志被算进热区 —— 无任何机制自动加载它们，这是虚高" \
+    "$(echo "$lgout" | sed -n '/热区（/,/冷区/p')" \
+  || ok "会话日志归入冷区（无机制自动加载，热区只算真进上下文的）"
+# 不变量：热区占比不该随日志体积变化。比「列表里没有」更难糊弄 ——
+# 万一将来换了渲染方式、列表不显示但仍在计数，这条照样能抓到。
+pct1=$(echo "$lgout" | grep -o '([0-9]*%)' | head -1)
+[ "$pct0" = "$pct1" ] \
+  && ok "加 16 KB 日志后热区占比不变（${pct0} → ${pct1}，热区与项目年龄无关）" \
+  || bad "热区占比随日志体积变了：${pct0} → ${pct1} —— K4 承诺被打破"
+rm -r "$LG"
 rm -rf "$PJ"
 
 # ─────────────────────────────────────────────────────────────
@@ -756,6 +913,133 @@ h = d.get('hookSpecificOutput') or {}
 sys.exit(0 if not d or (h.get('hookEventName') == 'SessionStart' and 'additionalContext' in h) else 1)" \
   && ok "SessionStart 用 hookSpecificOutput.additionalContext（该事件支持注入）" \
   || bad "SessionStart 输出不符协议" "$btext"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "PATHCONFLICT · .ratchet/log 不是目录时：人话报错，且失败不许静默"
+# ─────────────────────────────────────────────────────────────
+# 溯源：GitHub #2（trellis-suite 现场）。`.ratchet/log` 一度是普通文件，于是：
+#   · init   —— 裸 makedirs 抛 FileExistsError，新用户第一步就吃一屏 traceback
+#   · digest —— 同样裸调，hook 模式被兜底 except 吞成 `{}`，退出码 0、stderr 空、
+#               hits 无记录 —— 四个通道全静默。用户以为天天在留痕，实际一片空白。
+# 静默比崩溃危险：崩溃会被看见，静默要等到翻历史时才发现。
+# 信号通道选 systemMessage —— SessionEnd 唯一协议合法且用户可见的字段（见上方 UNIVERSAL）。
+# 不写 hits：那是 guard 命中的口径，ratchet-audit 按 rule 与已知规则对账，掺进去是噪声。
+PC=$(mktemp -d); mkdir -p "$PC/.ratchet"; : > "$PC/.ratchet/log"   # log 是普通文件
+
+pcout=$($BIN/ratchet-init --preset standard --root "$PC" 2>&1); pcrc=$?
+[ "$pcrc" -ne 0 ] && ok "init 路径冲突时退出非零（rc=${pcrc}）" \
+  || bad "init 路径冲突却报成功 —— 骨架没铺全，用户无感知"
+echo "$pcout" | grep -q "Traceback" \
+  && bad "init 吐了 traceback —— 脚手架最该稳的时刻甩给用户一屏栈" "$pcout" \
+  || ok "init 不吐 traceback"
+echo "$pcout" | grep -q ".ratchet/log" \
+  && ok "init 报错点名了冲突路径（用户能直接照着处理）" \
+  || bad "init 报错没说是哪个路径冲突" "$pcout"
+[ -f "$PC/.ratchet/log" ] \
+  && ok "init 没动用户的文件（那是用户数据，只报错不代劳）" \
+  || bad "init 擅自删改了冲突路径 —— 绝不允许"
+
+# digest hook：不许崩会话（rc=0 + 合法 JSON），但也不许静默。
+# 夹具必须是「init 成功后 log 才被破坏」的项目 —— 否则 run_hook 在
+# `not isfile(state.json)` 那一步就判成非 ratchet 项目早退，`{}` 与路径冲突无关，
+# 断言会为了错误的原因变绿。（本条注释是实测踩出来的：第一版夹具正是这么写错的。）
+PD=$(mktemp -d)
+$BIN/ratchet-init --preset standard --root "$PD" >/dev/null 2>&1
+rm -r "$PD/.ratchet/log"; : > "$PD/.ratchet/log"
+dgerr="$PD/dg.err"
+pcdg=$(printf '{"cwd":"%s","transcript_path":"%s"}' "$PD" "$TMP/cmd.jsonl" \
+       | $BIN/ratchet-digest --hook 2>"$dgerr"); dgrc=$?
+[ "$dgrc" -eq 0 ] && ok "digest hook 路径冲突时仍 rc=0（留痕失败不该把会话搞崩）" \
+  || bad "digest hook 退出码 ${dgrc} —— 会话被留痕故障拖崩"
+echo "$pcdg" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+allowed = set('$UNIVERSAL'.split())
+sys.exit(0 if set(d) <= allowed else 1)" 2>/dev/null \
+  && ok "digest 失败输出仍只含 universal 字段（协议不能因为出错就破)" \
+  || bad "digest 失败输出违反 SessionEnd 协议" "$pcdg"
+echo "$pcdg" | python3 -c "
+import json, sys
+sys.exit(0 if (json.load(sys.stdin).get('systemMessage') or '').strip() else 1)" 2>/dev/null \
+  && ok "digest 失败时 systemMessage 给出可见信号（不再静默吞成 {}）" \
+  || bad "digest 留痕失败却静默 —— 用户以为在留痕，实际什么都没写" "$pcdg"
+[ -s "$dgerr" ] && ok "digest 失败同时写了 stderr（CLI/调试可见）" \
+  || bad "digest 失败 stderr 为空"
+
+# 对照：同一份 transcript 在正常 log 目录下必须真落盘。
+# 没有这条，上面几条可能因为「压根没走到 makedirs」而假绿。
+PE=$(mktemp -d); $BIN/ratchet-init --preset standard --root "$PE" >/dev/null 2>&1
+printf '{"cwd":"%s","transcript_path":"%s"}' "$PE" "$TMP/cmd.jsonl" \
+  | $BIN/ratchet-digest --hook >/dev/null 2>&1
+ls "$PE/.ratchet/log/"*.md >/dev/null 2>&1 \
+  && ok "对照组：log 为正常目录时同一夹具真落盘（证明上面测的确实是冲突路径）" \
+  || bad "对照组没落盘 —— 上面的失败断言可能测错了代码路径"
+
+# 校验器：堵死同类错。裸 os.makedirs 的 exist_ok 只对「已是目录」豁免，
+# 剩下的情况一律 FileExistsError。全仓只准走 lib/paths.py 的 ensure_dir。
+bare=$(grep -rn "os\.makedirs" bin/ 2>/dev/null || true)
+[ -z "$bare" ] && ok "bin/ 无裸 os.makedirs（目录落地统一走 ensure_dir）" \
+  || bad "bin/ 出现裸 os.makedirs —— 路径冲突会再次抛 traceback" "$bare"
+rm -r "$PC" "$PD" "$PE"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "DIGEST·落盘 · 命名由机制决定，文档不许与代码分叉"
+# ─────────────────────────────────────────────────────────────
+# 溯源：GitHub #4。CLI digest 只 render 到 stdout，落盘命名全靠调用方重定向，
+# 而 skills/handoff/SKILL.md 给的正是那条不带落盘参数的命令 —— 于是野外出现
+# 无日期前缀的 s-1.md，与 hook 的 {today}-s{n}.md 分叉。
+# 分叉只发生在手动路径，所以修手动路径：--out 开关不接文件名，命名权收归机制。
+grep -q "track/" bin/ratchet-digest \
+  && bad "docstring 仍写 track/ 旧路径 —— 96298c7 时代遗物，会误导维护者与 AI" \
+  || ok "digest 无 track/ 旧路径残留（文档与代码不分叉）"
+
+DO=$(mktemp -d); $BIN/ratchet-init --preset standard --root "$DO" >/dev/null 2>&1
+TODAY=$(date +%F)
+$BIN/ratchet-digest --transcript "$TMP/cmd.jsonl" --session 4 --out --root "$DO" >/dev/null 2>&1
+[ -f "$DO/.ratchet/log/${TODAY}-s4.md" ] \
+  && ok "--out 落盘到 .ratchet/log/{today}-s{N}.md（与 hook 同一命名）" \
+  || bad "--out 未按约定命名落盘" "$(ls "$DO/.ratchet/log/" 2>&1)"
+
+# 留痕不能被抹：已存在则拒绝覆盖，且要说清楚。
+# 前置守卫不可省 —— 文件不存在时 shasum 两边都空、rc 也非零，这条会为了
+# 完全错误的原因变绿（写这段时真的先绿了一次，那时 --out 还不存在）。
+if [ ! -f "$DO/.ratchet/log/${TODAY}-s4.md" ]; then
+  bad "覆盖断言无法执行：--out 根本没落盘"
+else
+  echo "手写的决策段" >> "$DO/.ratchet/log/${TODAY}-s4.md"   # 模拟用户已补写
+  before=$(shasum "$DO/.ratchet/log/${TODAY}-s4.md" | cut -d' ' -f1)
+  ovout=$($BIN/ratchet-digest --transcript "$TMP/cmd.jsonl" --session 4 --out --root "$DO" 2>&1); ovrc=$?
+  after=$(shasum "$DO/.ratchet/log/${TODAY}-s4.md" | cut -d' ' -f1)
+  [ "$before" = "$after" ] && [ "$ovrc" -ne 0 ] \
+    && ok "--out 拒绝覆盖已有留痕（rc=${ovrc}，手写内容未被抹）" \
+    || bad "--out 覆盖了已存在的日志 —— 用户手写的决策段没了" "$ovout"
+fi
+
+# --out 是开关不是路径：跟在后面的文件名会被 argparse 当位置参数拒绝，
+# 命名权不下放。断言「那个名字没被落盘」而不是「命令失败」——
+# 后者在 --out 不存在时也成立，区分不出真假。
+$BIN/ratchet-digest --transcript "$TMP/cmd.jsonl" --out s-1.md --root "$DO" >/dev/null 2>&1
+find "$DO" -name "s-1.md" | grep -q . \
+  && bad "--out 接受了自定义文件名 —— 命名自由就是分叉的来源" \
+  || ok "--out 不接受自定义文件名（开关式，命名权在机制）"
+# 反向锁：--out 确实能落盘（上面那条不能只靠「什么都没生成」就算过）
+ls "$DO/.ratchet/log/"*.md >/dev/null 2>&1 \
+  && ok "--out 通路本身有效（反向锁，防上一条空过）" \
+  || bad "--out 什么都没落盘 —— 上一条断言毫无意义"
+
+# stdout 通路必须原样保留 —— handoff 之外还有别的用法，不能因为加了 --out 就改行为
+sout=$($BIN/ratchet-digest --transcript "$TMP/cmd.jsonl" --session 9 --root "$DO" 2>/dev/null)
+echo "$sout" | grep -q "^# s-9" \
+  && ok "不带 --out 时仍只渲染到 stdout（既有通路不变）" \
+  || bad "无 --out 的 stdout 行为被改坏" "$(echo "$sout" | head -3)"
+
+# skill 与机制对齐：handoff 让 AI 跑的命令必须带落盘参数，否则命名自由原样留着
+grep -q -- "--out" skills/handoff/SKILL.md \
+  && ok "handoff skill 使用 --out（AI 不再自行重定向命名）" \
+  || bad "handoff skill 仍给不带 --out 的命令 —— 分叉源头没堵上"
+rm -r "$DO"
 
 # ─────────────────────────────────────────────────────────────
 echo

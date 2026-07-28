@@ -36,10 +36,76 @@ import sys
 # 长期零命中的规则是化石（问题多半已被工具根治），该淘汰；
 # 高频命中说明它是真问题，值得留着。没有命中数据，减法就只能靠拍脑袋。
 
+class Pred:
+    """鸭子类型成 re.Pattern，让规则既能是正则、也能是判定函数。
+
+    引擎是 `for rid, pat, why in DENY: pat.search(scan)` —— 只要有 .search 就行，
+    一行都不用改。有些危险动作（比如 flag 可以任意拆分重排的 rm）用正则表达
+    正确语义会退化成没人看得懂的一行，那种就该写成函数。
+    """
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def search(self, s: str):
+        return self.fn(s)
+
+
+_RM = re.compile(r"\brm\b")
+_SEP = re.compile(r"\|\||&&|[;|&\n]")
+
+
+def rm_recursive_force(text: str) -> bool:
+    """rm 同时带上「递归」与「强制」—— 任意 flag 写法都要认出来。
+
+    溯源：真实漏拦。首版正则要求 r 与 f 落在**同一个 flag 簇**里
+    （`-[a-zA-Z]*[rR][a-zA-Z]*f`），前缀的 `(-[a-zA-Z]*\\s+)*` 只是跳过前面的簇。
+    于是 7 种语义完全等价、破坏力完全相同的写法直接穿透：
+
+        rm -r -f    rm -f -r    rm -r -f -v
+        rm --recursive --force    rm -r --force
+        rm --force -r             rm --force --recursive
+
+    实测确认（不是推演）：`rm -r -f <目录>` 在真实会话里被放行，目录连同
+    canary 文件一起没了。这个洞从 guard 初版就在，v0.1.10 / v0.1.11 同样漏。
+
+    所以不再猜 flag 的排列，直接解析：把 rm 之后到下一个 shell 分隔符之间的
+    token 全扫一遍，短簇含 r/R 或长选项 --recursive 即递归，含 f 或 --force
+    即强制，两者皆真才拦。长选项按前缀匹配（GNU 允许缩写，且 rm 的长选项里
+    r 开头只有 recursive、f 开头只有 force，不会撞）。
+
+    `--` 之后是文件名不是选项，就此停手 —— `rm -r -- -f` 是删名叫 `-f` 的文件，
+    不是 rm -rf，拦它才是误拦。
+    """
+    for m in _RM.finditer(text):
+        seg = _SEP.split(text[m.end():], maxsplit=1)[0]
+        recursive = force = False
+        for tok in seg.split():
+            if tok == "--":
+                break
+            if tok.startswith("--"):
+                name = tok[2:].split("=")[0]
+                if name and "recursive".startswith(name):
+                    recursive = True
+                if name and "force".startswith(name):
+                    force = True
+            elif tok.startswith("-") and len(tok) > 1:
+                # 短簇。不 break 在非 flag token 上 —— GNU 允许选项出现在
+                # 操作数之后（`rm dir -rf` 照样递归删），漏掉就是新的绕过口。
+                letters = tok[1:]
+                if "r" in letters or "R" in letters:
+                    recursive = True
+                if "f" in letters:
+                    force = True
+            if recursive and force:
+                return True
+    return False
+
+
 # ── deny：不可逆的破坏 ───────────────────────────────────────────────
 DENY = [
     ("rm-rf",
-     re.compile(r"\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR][a-zA-Z]*f|\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*f[a-zA-Z]*[rR]"),
+     Pred(rm_recursive_force),
      "递归强制删除（rm -rf）。要删就明确列出路径，或让用户自己执行。"),
     ("push-force",
      re.compile(r"\bgit\s+push\b.*(--force\b(?!-with-lease)|(?<![\w-])-f(?![\w-]))"),
