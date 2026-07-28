@@ -241,6 +241,66 @@ INTERPRETERS = {
 }
 
 
+def split_top_level(cmd: str) -> list[str]:
+    """按 shell 分隔符切，但**只切引号外面的**。分隔符原样保留在结果里。
+
+    溯源：80 条 guard 命中的复盘。首版用 `re.split(r"(\\|\\||&&|[;|&\\n])", cmd)`
+    无脑切，于是引号**内部**的 | ; & 也被当成分隔符 —— `grep "foo\\|bar" f`
+    被劈成两半，每半的引号都不配平，shlex 抛错，整条命令退化成原文匹配。
+
+    实测中招范围很广，全是日常写法：
+        grep "a\\|b" f          awk '{print $1; print $2}' f
+        echo "a|b"             sed 's/x/y/;s/z/w/' f
+
+    后果是「提到 ≠ 执行」这个特性在这些命令上静默失效：`grep "rm -rf" f`
+    能正常放行，`grep "rm -rf\\|foo" f` 却被 deny —— 差别只在引号里多了个 `|`。
+    方向是保守的（误拦不是漏拦），但误拦会训练用户去绕过门禁，
+    而 guard 自己的注释早就写明：动辄误拦的门禁会被直接关掉，那时保护等于零。
+
+    返回值形状与原来的 re.split(带捕获组) 一致：段、分隔符、段……
+    引号未闭合时不做补救 —— 整段原样留给 shlex 去失败，保守回退照常触发。
+    """
+    out, buf = [], []
+    q = None          # 当前所处的引号字符；None = 在引号外
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if q:
+            buf.append(c)
+            if c == "\\" and q == '"' and i + 1 < n:
+                buf.append(cmd[i + 1])   # 双引号里反斜杠转义下一个字符
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c in "'\"":
+            q = c
+            buf.append(c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            buf.append(c)
+            buf.append(cmd[i + 1])       # 引号外的转义：\| 不是分隔符
+            i += 2
+            continue
+        if cmd[i:i + 2] in ("||", "&&"):
+            out.append("".join(buf)); buf = []
+            out.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if c in ";|&\n":
+            out.append("".join(buf)); buf = []
+            out.append(c)
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    out.append("".join(buf))
+    return out
+
+
 def scan_text(cmd: str) -> tuple[str, str | None]:
     """返回 (用于危险模式匹配的文本, 保守回退的原因或 None)。
 
@@ -270,7 +330,7 @@ def scan_text(cmd: str) -> tuple[str, str | None]:
     # 切掉分隔符会让它们悄悄失效（首版这么写，`curl … | sh` 直接从 ask 掉成 allow）。
     out = []
     fallback = None
-    for sc in re.split(r"(\|\||&&|[;|&\n])", cmd):
+    for sc in split_top_level(cmd):
         if re.fullmatch(r"\|\||&&|[;|&\n]", sc or ""):
             out.append(sc)          # 分隔符原样保留
             continue
