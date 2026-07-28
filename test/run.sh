@@ -140,22 +140,40 @@ expect deny "sudo rm -rf --no-preserve-root /"
 expect deny "rm dir -rf"                    # GNU 允许选项在操作数之后
 expect deny "rm -R --force node_modules"    # 大写 R 同样是递归
 
-# 反向锁：修漏拦不许把安全用法一起拦掉。
-# 没有这一栏，把规则改成「命令里出现 rm 就拦」也能让上面全绿 —— 那是另一种坏。
-expect allow "rm -r node_modules"           # 递归但不强制，不在 deny 之列
-expect allow "rm -f stale.lock"             # 强制但不递归
-expect allow "rm a.txt"
-expect allow "rm -i -r build"               # 交互式递归，反而是安全姿势
-expect allow "rm -r -- -f"                  # -- 之后是文件名，删的是名叫 -f 的文件
-expect allow "npm-rf --help"                # rm 不是独立词，不该误命中
-expect allow "rmdir -p a/b/c"               # 压根不是 rm
-
-# 判定必须按「单条命令」切，不能把整行的 flag 混在一起看。
-# 这条最容易写错：天真实现会把 -r 和 -f 分别从两条命令里捡出来凑成 rf。
-expect allow "rm -r a && rm -f b"
-expect deny  "cd /tmp && rm -r -f target"   # 反过来，分隔符后的真 rf 不许漏
+expect deny  "cd /tmp && rm -r -f target"   # 分隔符后的真 rf 不许漏
 expect deny  "rm --recu --for dir"          # GNU 长选项缩写
 expect deny  "find . -exec rm -rf {} \\;"
+
+# ── rm -r（不带 -f）→ ask，不是 allow ─────────────────────────
+# 溯源：v0.1.12 发版验证时的反驳，实测坐实。原先 rm -r 直接放行，理由是
+# 「不带 -f 不算强制」。这个假设在 hook 环境里不成立 —— macOS 的 BSD rm 只在
+# stdin 是终端时才对只读文件提示；hook 环境非 tty，于是不提示、直接删。
+# 实测 rm -r 对可写与只读文件都是 rc=0 全删，与 rm -rf 没有任何区别。
+# 也就是说原规则在区分一个这个平台上并不存在的差异 —— 与 flag 拆分漏拦同类。
+# 不上 deny：rm -r build 是日常清理，deny 会让人去绕过门禁，那时保护等于零。
+expect ask "rm -r node_modules"
+expect ask "rm -R build"
+expect ask "rm --recursive dist"
+expect ask "rm -i -r build"                 # -i 在非 tty 下同样不提示，给不了保护
+expect ask "rm -r -- -f"                    # 递归；-f 在 -- 之后是文件名不是 force
+
+# 反向锁：不许把安全用法一起拦掉。
+# 没有这一栏，把规则改成「出现 rm 就拦」也能让上面全绿 —— 那是另一种坏。
+expect allow "rm -f stale.lock"             # 强制但不递归，删单个文件
+expect allow "rm a.txt"
+expect allow "npm-rf --help"                # rm 不是独立词，不该误命中
+expect allow "rmdir -p a/b/c"               # 压根不是 rm
+# git rm --cached 只动索引、文件留在盘上；--dry-run 什么都不做。
+# 两者都不删文件，拦它们是纯误报 —— 而误报会训练用户去绕过门禁。
+# 这两条是把 rm -r 升到 ask 时**新引入**的误报，当场堵掉，不留给下一版。
+expect allow "git rm -r --cached secrets/"
+expect allow "git rm -r --dry-run src/old"
+expect ask   "git rm -r src/old"            # 没有 --cached：真的会删工作区文件
+
+# 判定必须按「单条命令」切，不能把整行的 flag 混在一起看。
+# 天真实现会把 -r 和 -f 分别从两条命令里捡出来凑成 rf → 误判成 deny。
+# 期望 ask（第一条 rm -r 落 ask 档）而**不是** deny —— 这个区分正是本条的意义。
+expect ask "rm -r a && rm -f b"
 expect deny "git push --force origin main"
 expect deny "git push -f"
 expect deny "git reset --hard HEAD~3"
@@ -527,7 +545,7 @@ for p in ('.claude-plugin/plugin.json', '.codex-plugin/plugin.json'):
 m = json.load(open('.claude-plugin/marketplace.json'))
 v += [m['version'], m['metadata']['version']]
 print(' '.join(v) if len(set(v)) > 1 else 'ok')")
-[ "$vers" = "ok" ] && ok "版本号四处一致（VERSION/claude/codex/marketplace×2）" \
+[ "$vers" = "ok" ] && ok "版本号五处一致（VERSION/claude/codex/marketplace×2）" \
   || bad "版本号不一致 —— Codex cache 按版本号分目录，不 bump 就拿不到新代码且无报错" "$vers"
 
 # 宪法 4 KB 硬上限 —— 一份没人读完的宪法等于没有宪法
