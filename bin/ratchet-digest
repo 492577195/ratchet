@@ -69,6 +69,17 @@ def rel(p: str, root: str) -> str:
         return p
 
 
+def _in_project(p: str, root: str) -> bool:
+    """项目内文件？项目外的（scratchpad 草稿、memory 等会话副产物）明细列出来
+    只会淹没真实改动 —— 真实会话里它们占改动清单的 2/3（s-2 溯源）。
+    注意边界：目录名可以合法地以 .. 开头（..foo），所以不能只判 startswith("..")。"""
+    try:
+        r = os.path.relpath(p, root)
+    except ValueError:
+        return False  # Windows 跨盘符，必为项目外
+    return r != ".." and not r.startswith(".." + os.sep)
+
+
 def render(d: transcript.Digest, session: int | None, root: str, tid: str = "") -> str:
     today = datetime.date.today().isoformat()
     sid = f"s-{session}" if session is not None else "s-?"
@@ -84,11 +95,15 @@ def render(d: transcript.Digest, session: int | None, root: str, tid: str = "") 
     L.append("## 做了什么（自动抽取，勿手改）")
     L.append("")
     if d.files_written:
+        inside = [f for f in d.files_written if _in_project(f, root)]
+        n_out = len(d.files_written) - len(inside)
         L.append("**改动文件**")
-        for f in d.files_written[:MAX_FILES]:
+        for f in inside[:MAX_FILES]:
             L.append(f"- `{rel(f, root)}`")
-        if len(d.files_written) > MAX_FILES:
-            L.append(f"- …另有 {len(d.files_written) - MAX_FILES} 个")
+        if len(inside) > MAX_FILES:
+            L.append(f"- …另有 {len(inside) - MAX_FILES} 个")
+        if n_out:
+            L.append(f"- …另改动 {n_out} 个项目外文件（scratchpad/memory 等，略）")
         L.append("")
 
     cmds = signal_commands(d.commands)

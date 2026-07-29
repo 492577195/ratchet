@@ -106,6 +106,52 @@ fi
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "DIGEST · 项目外文件聚合，不刷屏"
+# ─────────────────────────────────────────────────────────────
+# 溯源：s-2 会话日志。「改动文件」清单 2/3 是 scratchpad 草稿与 memory
+# （../../../../private/tmp/... 型噪音），真实改动被淹没。项目外文件只留聚合行。
+DGP=$(mktemp -d); trap 'rm -rf "$TMP" "$GTMP" "$DGP"' EXIT
+python3 - "$TMP/files.jsonl" "$DGP" <<'PY'
+import json, os, sys
+out, root = sys.argv[1], sys.argv[2]
+files = [
+    os.path.join(root, "src/a.py"),                    # 项目内
+    os.path.join(root, "..foo/b.py"),                  # 项目内，目录名以 .. 开头（边界）
+    "/private/tmp/claude-501/x/scratchpad/c3.txt",     # 项目外 scratchpad
+    "/private/tmp/claude-501/x/scratchpad/mkfix.py",   # 项目外 scratchpad
+    os.path.expanduser("~/.claude/projects/p/memory/MEMORY.md"),  # 项目外 memory
+]
+recs = [{"type": "assistant", "message": {"model": "claude-opus-4-8", "usage": {},
+        "content": [{"type": "tool_use", "name": "Write", "input": {"file_path": f}}]}}
+        for f in files]
+with open(out, "w") as fh:
+    for r in recs:
+        fh.write(json.dumps(r) + "\n")
+PY
+body=$($BIN/ratchet-digest --transcript "$TMP/files.jsonl" --session 1 --root "$DGP")
+echo "$body" | grep -q '`src/a.py`' && ok "项目内文件正常列出" || bad "项目内文件丢失" "$(echo "$body" | grep -A6 '改动文件')"
+echo "$body" | grep -q '`..foo/b.py`' && ok "..foo 型目录不被误判为项目外" || bad "..foo 型目录被误聚合（边界 bug）" "$(echo "$body" | grep -A6 '改动文件')"
+if echo "$body" | grep -q 'scratchpad/c3.txt\|MEMORY.md'; then
+  bad "项目外文件明细仍刷屏"
+else
+  ok "项目外文件明细不再出现"
+fi
+echo "$body" | grep -q '另改动 3 个项目外文件' && ok "项目外文件聚合成一行（3 个）" || bad "聚合行缺失或计数错误" "$(echo "$body" | grep -A6 '改动文件')"
+
+# 全部文件都在项目外时：标题下只剩聚合行，不留空标题
+python3 - "$TMP/outside.jsonl" <<'PY'
+import json, sys
+recs = [{"type": "assistant", "message": {"model": "claude-opus-4-8", "usage": {},
+        "content": [{"type": "tool_use", "name": "Write", "input": {"file_path": "/private/tmp/t/f.py"}}]}}]
+with open(sys.argv[1], "w") as fh:
+    for r in recs:
+        fh.write(json.dumps(r) + "\n")
+PY
+body=$($BIN/ratchet-digest --transcript "$TMP/outside.jsonl" --session 1 --root "$DGP")
+echo "$body" | grep -q '另改动 1 个项目外文件' && ok "纯项目外会话也有聚合行" || bad "纯项目外会话聚合行缺失" "$(echo "$body" | grep -A4 '改动文件')"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "GUARD · 危险动作拦截"
 # ─────────────────────────────────────────────────────────────
 # cwd 必须是隔离沙箱，不能是 $PWD。guard 会按 cwd 找 .ratchet/ 并追加 hits.jsonl，
