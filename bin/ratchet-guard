@@ -55,6 +55,62 @@ _RM = re.compile(r"\brm\b")
 _SEP = re.compile(r"\|\||&&|[;|&\n]")
 
 
+def _rm_flags(text: str):
+    """扫出每条 rm 调用的 (递归?, 强制?)。逐条命令 yield，绝不跨命令混。
+
+    跨命令混是个真陷阱：`rm -r a && rm -f b` 两条命令各自都不危险，
+    天真实现会把 -r 和 -f 捡出来凑成 rf。
+    """
+    for m in _RM.finditer(text):
+        seg = _SEP.split(text[m.end():], maxsplit=1)[0]
+        recursive = force = harmless = False
+        for tok in seg.split():
+            if tok == "--":
+                break            # 之后是文件名不是选项
+            if tok.startswith("--"):
+                name = tok[2:].split("=")[0]
+                if name and "recursive".startswith(name):
+                    recursive = True
+                if name and "force".startswith(name):
+                    force = True
+                # git rm --cached 只动索引，文件留在盘上，git add 就能回来；
+                # --dry-run 什么都不做。两者都不删文件，拦它们是纯误报 ——
+                # 而误报会训练用户去绕过门禁。普通 rm 没有这两个长选项，
+                # 所以认它们不会削弱对真 rm 的拦截。
+                if name and ("cached".startswith(name) or "dry-run".startswith(name)):
+                    harmless = True
+            elif tok.startswith("-") and len(tok) > 1:
+                # 不在非 flag token 处停 —— GNU 允许选项出现在操作数之后
+                # （`rm dir -rf` 照样递归删），停了就是新的绕过口。
+                letters = tok[1:]
+                if "r" in letters or "R" in letters:
+                    recursive = True
+                if "f" in letters:
+                    force = True
+        yield (False, False) if harmless else (recursive, force)
+
+
+def rm_recursive(text: str) -> bool:
+    """rm 递归删除（不论带不带 force）→ ask。
+
+    溯源：v0.1.12 发版验证时的反驳，实测坐实。原先只有 rm -rf 进 deny，
+    rm -r 直接放行，理由是「不带 -f 不算强制」。这个假设在 hook 环境里不成立：
+
+    macOS 的 BSD rm 只在 **stdin 是终端** 时才对只读文件提示确认；hook 环境
+    stdin 非 tty，于是不提示、直接删。实测 `rm -r` 对可写和只读文件都是
+    rc=0、全部删光 —— 与 rm -rf 的删除效果没有任何区别。
+
+    也就是说，原规则在区分一个这个平台上并不存在的差异。这与刚修掉的
+    flag 拆分漏拦是同一类缺陷：语义等价、破坏力等价，却因为规则盯着 flag
+    的字面组合而放行。
+
+    不上 deny 而是 ask：`rm -r build` 这类清理是日常动作，deny 会让人去绕过
+    门禁 —— 动辄误拦的门禁会被直接关掉，那时保护等于零。ask 把决定权交回
+    给人，既不阻断也不静默放行。同档的先例是 git push。
+    """
+    return any(r for r, _ in _rm_flags(text))
+
+
 def rm_recursive_force(text: str) -> bool:
     """rm 同时带上「递归」与「强制」—— 任意 flag 写法都要认出来。
 
@@ -77,29 +133,7 @@ def rm_recursive_force(text: str) -> bool:
     `--` 之后是文件名不是选项，就此停手 —— `rm -r -- -f` 是删名叫 `-f` 的文件，
     不是 rm -rf，拦它才是误拦。
     """
-    for m in _RM.finditer(text):
-        seg = _SEP.split(text[m.end():], maxsplit=1)[0]
-        recursive = force = False
-        for tok in seg.split():
-            if tok == "--":
-                break
-            if tok.startswith("--"):
-                name = tok[2:].split("=")[0]
-                if name and "recursive".startswith(name):
-                    recursive = True
-                if name and "force".startswith(name):
-                    force = True
-            elif tok.startswith("-") and len(tok) > 1:
-                # 短簇。不 break 在非 flag token 上 —— GNU 允许选项出现在
-                # 操作数之后（`rm dir -rf` 照样递归删），漏掉就是新的绕过口。
-                letters = tok[1:]
-                if "r" in letters or "R" in letters:
-                    recursive = True
-                if "f" in letters:
-                    force = True
-            if recursive and force:
-                return True
-    return False
+    return any(r and f for r, f in _rm_flags(text))
 
 
 # ── deny：不可逆的破坏 ───────────────────────────────────────────────
@@ -128,7 +162,12 @@ DENY = [
 ]
 
 # ── ask：可能危险，转人工 ────────────────────────────────────────────
+# 顺序无关：DENY 先跑完才轮到这里，所以 rm -rf 走 deny，rm -r 才落到 rm-r。
 ASK = [
+    ("rm-r",
+     Pred(rm_recursive),
+     "递归删除。非 tty 下 rm -r 不会提示确认，删除效果与 rm -rf 相同、同样不可逆。"
+     "确认目标路径没写错，或让用户自己执行。"),
     ("push",
      re.compile(r"\bgit\s+push\b(?!.*--dry-run)"),
      "push 是对外动作，请确认目标分支与远端。"),
@@ -202,6 +241,66 @@ INTERPRETERS = {
 }
 
 
+def split_top_level(cmd: str) -> list[str]:
+    """按 shell 分隔符切，但**只切引号外面的**。分隔符原样保留在结果里。
+
+    溯源：80 条 guard 命中的复盘。首版用 `re.split(r"(\\|\\||&&|[;|&\\n])", cmd)`
+    无脑切，于是引号**内部**的 | ; & 也被当成分隔符 —— `grep "foo\\|bar" f`
+    被劈成两半，每半的引号都不配平，shlex 抛错，整条命令退化成原文匹配。
+
+    实测中招范围很广，全是日常写法：
+        grep "a\\|b" f          awk '{print $1; print $2}' f
+        echo "a|b"             sed 's/x/y/;s/z/w/' f
+
+    后果是「提到 ≠ 执行」这个特性在这些命令上静默失效：`grep "rm -rf" f`
+    能正常放行，`grep "rm -rf\\|foo" f` 却被 deny —— 差别只在引号里多了个 `|`。
+    方向是保守的（误拦不是漏拦），但误拦会训练用户去绕过门禁，
+    而 guard 自己的注释早就写明：动辄误拦的门禁会被直接关掉，那时保护等于零。
+
+    返回值形状与原来的 re.split(带捕获组) 一致：段、分隔符、段……
+    引号未闭合时不做补救 —— 整段原样留给 shlex 去失败，保守回退照常触发。
+    """
+    out, buf = [], []
+    q = None          # 当前所处的引号字符；None = 在引号外
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if q:
+            buf.append(c)
+            if c == "\\" and q == '"' and i + 1 < n:
+                buf.append(cmd[i + 1])   # 双引号里反斜杠转义下一个字符
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c in "'\"":
+            q = c
+            buf.append(c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            buf.append(c)
+            buf.append(cmd[i + 1])       # 引号外的转义：\| 不是分隔符
+            i += 2
+            continue
+        if cmd[i:i + 2] in ("||", "&&"):
+            out.append("".join(buf)); buf = []
+            out.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if c in ";|&\n":
+            out.append("".join(buf)); buf = []
+            out.append(c)
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    out.append("".join(buf))
+    return out
+
+
 def scan_text(cmd: str) -> tuple[str, str | None]:
     """返回 (用于危险模式匹配的文本, 保守回退的原因或 None)。
 
@@ -231,7 +330,7 @@ def scan_text(cmd: str) -> tuple[str, str | None]:
     # 切掉分隔符会让它们悄悄失效（首版这么写，`curl … | sh` 直接从 ask 掉成 allow）。
     out = []
     fallback = None
-    for sc in re.split(r"(\|\||&&|[;|&\n])", cmd):
+    for sc in split_top_level(cmd):
         if re.fullmatch(r"\|\||&&|[;|&\n]", sc or ""):
             out.append(sc)          # 分隔符原样保留
             continue

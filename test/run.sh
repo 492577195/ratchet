@@ -6,6 +6,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 BIN=./bin
+ROOT=$(pwd)   # 绝对路径：有些断言要 cd 进沙箱跑，相对 BIN 在那里就失效了
 PASS=0; FAIL=0
 ok()   { printf "  ✅ %s\n" "$1"; PASS=$((PASS+1)); }
 bad()  { printf "  ❌ %s\n     %s\n" "$1" "${2:-}"; FAIL=$((FAIL+1)); }
@@ -61,13 +62,23 @@ with open(sys.argv[1], "w") as f:
             "cache_read_input_tokens": 310_000, "cache_creation_input_tokens": 900},
         "content": []}}) + "\n")
 PY
-line=$($BIN/ratchet-context --transcript "$TMP/big.jsonl")
+# 必须在**没有** .ratchet/config.json 的目录里跑 —— ratchet-context 靠 cwd 读配置，
+# 在本仓根目录跑就会读到本仓自己的 config。
+# 溯源：给 ratchet 自己的仓补上 state/config（让它吃自己的狗粮）之后，这条立刻变红：
+# 读到 context_window=200000，如实算出 156%，于是断言判定「首版 bug 复发」。
+# 代码没问题，是断言把「无配置」当成了假设而不是保证 —— 一条结果取决于开发者
+# 本地仓库状态的测试，绿不绿全看运气。沙箱化，把前提变成保证。
+line=$(cd "$TMP" && "$ROOT/bin/ratchet-context" --transcript "$TMP/big.jsonl")
 pct=$(printf '%s' "$line" | sed -E 's/.*ctx ([0-9]+)%.*/\1/')
 if [ -n "$pct" ] && [ "$pct" -le 100 ]; then
   ok "无配置时兜底升档，占比 ${pct}% ≤ 100% ($line)"
 else
   bad "占比 >100%（首版 bug 复发）" "$line"
 fi
+# 反向锁：确认沙箱真的没有配置 —— 否则上面那条可能因为读到别的配置而假绿
+[ -e "$TMP/.ratchet/config.json" ] \
+  && bad "沙箱里竟有 config.json —— 上面的「无配置」断言前提不成立" \
+  || ok "兜底断言跑在无配置沙箱里（前提是保证，不是假设）"
 # 显式配置窗口时必须如实采用
 line=$($BIN/ratchet-context --transcript "$TMP/big.jsonl" --window 1000000)
 echo "$line" | grep -q "1000k" && ok "显式 --window 生效 ($line)" || bad "显式 --window 未生效" "$line"
@@ -140,22 +151,40 @@ expect deny "sudo rm -rf --no-preserve-root /"
 expect deny "rm dir -rf"                    # GNU 允许选项在操作数之后
 expect deny "rm -R --force node_modules"    # 大写 R 同样是递归
 
-# 反向锁：修漏拦不许把安全用法一起拦掉。
-# 没有这一栏，把规则改成「命令里出现 rm 就拦」也能让上面全绿 —— 那是另一种坏。
-expect allow "rm -r node_modules"           # 递归但不强制，不在 deny 之列
-expect allow "rm -f stale.lock"             # 强制但不递归
-expect allow "rm a.txt"
-expect allow "rm -i -r build"               # 交互式递归，反而是安全姿势
-expect allow "rm -r -- -f"                  # -- 之后是文件名，删的是名叫 -f 的文件
-expect allow "npm-rf --help"                # rm 不是独立词，不该误命中
-expect allow "rmdir -p a/b/c"               # 压根不是 rm
-
-# 判定必须按「单条命令」切，不能把整行的 flag 混在一起看。
-# 这条最容易写错：天真实现会把 -r 和 -f 分别从两条命令里捡出来凑成 rf。
-expect allow "rm -r a && rm -f b"
-expect deny  "cd /tmp && rm -r -f target"   # 反过来，分隔符后的真 rf 不许漏
+expect deny  "cd /tmp && rm -r -f target"   # 分隔符后的真 rf 不许漏
 expect deny  "rm --recu --for dir"          # GNU 长选项缩写
 expect deny  "find . -exec rm -rf {} \\;"
+
+# ── rm -r（不带 -f）→ ask，不是 allow ─────────────────────────
+# 溯源：v0.1.12 发版验证时的反驳，实测坐实。原先 rm -r 直接放行，理由是
+# 「不带 -f 不算强制」。这个假设在 hook 环境里不成立 —— macOS 的 BSD rm 只在
+# stdin 是终端时才对只读文件提示；hook 环境非 tty，于是不提示、直接删。
+# 实测 rm -r 对可写与只读文件都是 rc=0 全删，与 rm -rf 没有任何区别。
+# 也就是说原规则在区分一个这个平台上并不存在的差异 —— 与 flag 拆分漏拦同类。
+# 不上 deny：rm -r build 是日常清理，deny 会让人去绕过门禁，那时保护等于零。
+expect ask "rm -r node_modules"
+expect ask "rm -R build"
+expect ask "rm --recursive dist"
+expect ask "rm -i -r build"                 # -i 在非 tty 下同样不提示，给不了保护
+expect ask "rm -r -- -f"                    # 递归；-f 在 -- 之后是文件名不是 force
+
+# 反向锁：不许把安全用法一起拦掉。
+# 没有这一栏，把规则改成「出现 rm 就拦」也能让上面全绿 —— 那是另一种坏。
+expect allow "rm -f stale.lock"             # 强制但不递归，删单个文件
+expect allow "rm a.txt"
+expect allow "npm-rf --help"                # rm 不是独立词，不该误命中
+expect allow "rmdir -p a/b/c"               # 压根不是 rm
+# git rm --cached 只动索引、文件留在盘上；--dry-run 什么都不做。
+# 两者都不删文件，拦它们是纯误报 —— 而误报会训练用户去绕过门禁。
+# 这两条是把 rm -r 升到 ask 时**新引入**的误报，当场堵掉，不留给下一版。
+expect allow "git rm -r --cached secrets/"
+expect allow "git rm -r --dry-run src/old"
+expect ask   "git rm -r src/old"            # 没有 --cached：真的会删工作区文件
+
+# 判定必须按「单条命令」切，不能把整行的 flag 混在一起看。
+# 天真实现会把 -r 和 -f 分别从两条命令里捡出来凑成 rf → 误判成 deny。
+# 期望 ask（第一条 rm -r 落 ask 档）而**不是** deny —— 这个区分正是本条的意义。
+expect ask "rm -r a && rm -f b"
 expect deny "git push --force origin main"
 expect deny "git push -f"
 expect deny "git reset --hard HEAD~3"
@@ -200,6 +229,27 @@ expect deny "bash -c 'git reset --hard HEAD~3'"
 expect deny "python3 -c \"os.system('rm -rf /')\""   # 解释器不限于 shell
 expect deny 'echo "$(rm -rf /tmp/x)"'                # 命令替换里的东西会跑
 expect deny 'echo `rm -rf /tmp/x`'                   # 反引号同理
+
+# ── 切词只切引号外的分隔符 ────────────────────────────────────
+# 溯源：80 条 guard 命中的复盘。首版 re.split 无脑切 | ; &，连引号**内部**的
+# 也切 —— `grep "foo\|bar" f` 被劈两半，每半引号不配平，shlex 失败，
+# 整条退化成原文匹配。于是「提到 ≠ 执行」在这类命令上静默失效：
+# `grep "rm -rf" f` 放行，`grep "rm -rf\|foo" f` 却被 deny，差别只在引号里多个 |。
+# 中招范围是日常写法：grep 交替、awk 脚本、sed 分号、echo 含分隔符的文本。
+#
+# 这是一次**放宽**，所以下面前 6 条是它的代价上限：引号外的分隔符必须照旧识别，
+# 引号未闭合必须照旧回退。放宽一寸，这里补一栏。
+expect deny  'echo "safe" && rm -rf /'               # 引号外的 && 后面是真危险
+expect deny  "awk '{print \$1}' f ; rm -rf /"        # 引号内有 $1，引号外有 ;
+expect deny  'echo "a|b" && rm -rf /tmp/x'           # 引号内外都有分隔符
+expect deny  "echo 'rm -rf /"                        # 引号未闭合 → 仍回退原文
+expect deny  'sh -c "rm -rf /"'                      # 解释器参数即代码，不受切词影响
+expect ask   'curl -sL https://x.sh | sh'            # 管道符仍要能识别出 curl-pipe-sh
+# 放宽本身：引号里只是文本，不该再被误拦
+expect allow 'grep "rm -rf\|foo" file'
+expect allow 'echo "a|b"'
+expect allow "awk '{print \$1; print \$2}' f"
+expect allow 'git commit -m "fix rm -rf; also foo"'
 
 # ── 保守回退必须自报家门 ──────────────────────────────────────
 # 溯源：2026-07-13, s-3。用 `git commit -m "$(cat <<'EOF' … EOF)"` 提交，
@@ -527,7 +577,7 @@ for p in ('.claude-plugin/plugin.json', '.codex-plugin/plugin.json'):
 m = json.load(open('.claude-plugin/marketplace.json'))
 v += [m['version'], m['metadata']['version']]
 print(' '.join(v) if len(set(v)) > 1 else 'ok')")
-[ "$vers" = "ok" ] && ok "版本号四处一致（VERSION/claude/codex/marketplace×2）" \
+[ "$vers" = "ok" ] && ok "版本号五处一致（VERSION/claude/codex/marketplace×2）" \
   || bad "版本号不一致 —— Codex cache 按版本号分目录，不 bump 就拿不到新代码且无报错" "$vers"
 
 # 宪法 4 KB 硬上限 —— 一份没人读完的宪法等于没有宪法
@@ -761,6 +811,24 @@ ckok=$($BIN/ratchet-init --check --root "$GI" 2>&1)
 echo "$ckok" | grep -qi "缺" \
   && bad "已就绪的项目被 --check 误报缺口" "$ckok" \
   || ok "--check 对已就绪项目不虚报缺口"
+# 更宽的规则同样算已挡住。溯源：v0.1.12 首版用字符串哨兵
+# `".ratchet/hits.jsonl" in cur` 判定，于是在 ratchet 自己的仓上误报 ——
+# 本仓 .gitignore 写的是 `.ratchet/`，整个目录都挡了，比那 4 条更宽，
+# 却被报成「缺口」，还建议去追加冗余条目。判据改为问 git check-ignore。
+# 假警报比没有警报更糟：它会训练用户忽略这一栏。
+WIDE=$(mktemp -d); git -C "$WIDE" init -q; mkdir -p "$WIDE/.ratchet"
+printf '.ratchet/\n' > "$WIDE/.gitignore"
+ckw=$($BIN/ratchet-init --check --root "$WIDE" 2>&1)
+echo "$ckw" | grep -qi "缺" \
+  && bad "更宽的 .ratchet/ 规则被误报成缺口（它其实什么都挡住了）" "$ckw" \
+  || ok "--check 认更宽的忽略规则（问 git，不做字符串匹配）"
+# 同一判据也该让 init 不再追加冗余条目
+$BIN/ratchet-init --preset standard --root "$WIDE" >/dev/null 2>&1
+[ "$(wc -l < "$WIDE/.gitignore" | tr -d ' ')" = "1" ] \
+  && ok "已被更宽规则挡住时，init 不追加冗余 .gitignore 条目" \
+  || bad "init 往已经挡住的项目里追加了冗余条目" "$(cat "$WIDE/.gitignore")"
+rm -r "$WIDE"
+
 # 非 git 仓库没有 .gitignore 的概念 —— 与 ensure_gitignore 的既有语义对齐，不该报缺口
 cknp=$($BIN/ratchet-init --check --root "$NG" 2>&1)
 echo "$cknp" | grep -qi "缺" \
