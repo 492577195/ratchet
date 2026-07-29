@@ -160,10 +160,11 @@ echo "GUARD · 危险动作拦截"
 # 「有 .ratchet 时确实会写 hits」由下方 $PJ 那条用例覆盖。
 GTMP=$(mktemp -d); trap 'rm -rf "$TMP" "$GTMP"' EXIT
 
-# decision <命令> -> deny|ask|allow
+# decision <命令> [cwd] -> deny|ask|allow。cwd 缺省为无 .ratchet 的 GTMP 沙箱；
+# 传第二参可指定带 config 的项目根（push 开关等配置相关用例用）。
 decision() {
   printf '{"tool_name":"Bash","tool_input":{"command":%s},"cwd":"%s"}' \
-    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" "$GTMP" \
+    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" "${2:-$GTMP}" \
   | $BIN/ratchet-guard 2>/dev/null \
   | python3 -c 'import json,sys
 d=json.load(sys.stdin).get("hookSpecificOutput")
@@ -257,6 +258,10 @@ expect allow "git resetting-branch-name"
 
 # force-with-lease 是安全强推，不该 deny（但 push 本身仍值得确认 → ask）
 expect ask "git push --force-with-lease origin feature"
+
+# 普通 push 缺省也是 ask（基线：guard.push 开关的缺省保守侧。
+# 开关开启后的放行由下方「PUSH 分级」段覆盖）
+expect ask "git push origin dev"
 
 # ── 提到 ≠ 执行 ──────────────────────────────────────────────
 # 首版对整条命令原文做匹配，于是「只是提到危险串」的命令也被 deny：写文档、
@@ -432,7 +437,11 @@ print(d["permissionDecision"] if d else "allow")')
 ro_expect allow Write "$(ro_json file_path "$PWD/bin/ratchet-guard" content x)" \
   "开发模式下 guard 源码可改（否则没法开发 ratchet 自己）"
 
-# 但没声明只读区的项目，config.json 不该被无端锁住 —— 否则谁也配不了它
+# config.json 无条件自封（v0.1.14 起，不再要求先声明只读区）。
+# 溯源：config 新增 guard.push=allow 开关后，它本身就是**解除门禁的通路** ——
+# AI 能编辑它，等于 AI 能关掉自己的门禁。配它的是用户（手动编辑不经过 hook），
+# 不是 AI。这条断言曾被设计成相反的（「没声明只读区时不该锁 config，否则谁也
+# 配不了它」）—— 那个理由在 config 能解除门禁之后不再成立，随设计反转。
 NORO=$(mktemp -d); mkdir -p "$NORO/.ratchet"
 printf '{"preset":"standard"}' > "$NORO/.ratchet/config.json"
 got=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s/.ratchet/config.json","content":"x"},"cwd":"%s"}' "$NORO" "$NORO" \
@@ -440,8 +449,18 @@ got=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s/.ratchet/config
   | python3 -c 'import json,sys
 d=json.load(sys.stdin).get("hookSpecificOutput")
 print(d["permissionDecision"] if d else "allow")')
-[ "$got" = "allow" ] && ok "allow  ← 未声明只读区时 config.json 可正常编辑" \
-  || bad "无只读区的项目里 config.json 被锁死 —— 那就没人配得了它"
+[ "$got" = "deny" ] && ok "deny  ← AI 编辑 config（它能解除门禁，无条件自封）" \
+  || bad "config.json 能被 AI 编辑 —— guard.push 等开关可以被 AI 自己打开"
+
+# 连「项目还没 init、config 不存在」也不能让 AI 自己创建一份 ——
+# 否则 AI 写出 guard.push=allow 就给自己开了门
+got=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s/.ratchet/config.json","content":"{}"},"cwd":"%s"}' "$GTMP" "$GTMP" \
+  | $BIN/ratchet-guard 2>/dev/null \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin).get("hookSpecificOutput")
+print(d["permissionDecision"] if d else "allow")')
+[ "$got" = "deny" ] && ok "deny  ← AI 在未 init 项目里自创 config（给自己开门）" \
+  || bad "AI 能自创 config.json —— guard.push 开关形同虚设"
 
 # ── Codex apply_patch：与 CC 的 payload 形状不同，guard 曾两头都错 ──────
 # apply_patch 没有 tool_input.file_path，路径埋在补丁头里，正文也不是 shell 命令。
@@ -477,6 +496,47 @@ echo "$out" | grep -qi "warning\|traceback" && bad "guard 输出混入噪声" "$
 # 决策必须走 JSON body，退出码恒 0（非 0 会被平台当成 hook 自身故障）
 printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard >/dev/null 2>&1
 [ $? -eq 0 ] && ok "deny 时退出码仍为 0（决策走 JSON，非退出码）" || bad "deny 时退出码非 0 —— 会被平台误判为 hook 故障"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "PUSH 分级 · guard.push 开关"
+# ─────────────────────────────────────────────────────────────
+# 溯源：hits.jsonl 84 条命中里 push ask 40 次、deny 0 次 —— 最高频机制税。
+# 用户显式配置 { "guard": { "push": "allow" } } 后普通 push 不再转人工。
+# 设计红线：
+#   · 缺省/缺文件/垃圾值 → 维持 ask（老用户升级行为不变，写错格式不开门）
+#   · DENY 表（push --force 系）无开关 —— 能关掉的只有「确认」，
+#     关不掉「不可逆保护」
+#   · config.json 对 AI 只读（上方 READONLY 段），开关只能用户手动开
+PC=$(mktemp -d); mkdir -p "$PC/.ratchet"; trap 'rm -rf "$TMP" "$GTMP" "$DGP" "$PC" "$PCJ"' EXIT
+printf '{"preset":"standard","guard":{"push":"allow"}}' > "$PC/.ratchet/config.json"
+
+[ "$(decision 'git push origin dev' "$PC")" = "allow" ] \
+  && ok "allow ← guard.push=allow 时普通 push 放行" \
+  || bad "guard.push=allow 未生效：普通 push 仍被转人工"
+[ "$(decision 'git push --force-with-lease origin feature' "$PC")" = "allow" ] \
+  && ok "allow ← force-with-lease 也随开关放行（它本在 ASK 档）" \
+  || bad "force-with-lease 未随开关放行"
+
+# DENY 表无开关：force 系写法一种都不能被 config 放掉
+[ "$(decision 'git push --force origin main' "$PC")" = "deny" ] \
+  && ok "deny  ← 开关开启时 push --force 仍拒（DENY 无开关）" \
+  || bad "guard.push=allow 竟放掉了 push --force —— 不可逆保护被开关穿透"
+[ "$(decision 'git push -f' "$PC")" = "deny" ] \
+  && ok "deny  ← 开关开启时 push -f 仍拒" \
+  || bad "guard.push=allow 竟放掉了 push -f"
+
+# 保守解析：垃圾值不开门（true / "yes" / 1 都不是精确的 "allow"）
+PCJ=$(mktemp -d); mkdir -p "$PCJ/.ratchet"
+printf '{"guard":{"push":true}}' > "$PCJ/.ratchet/config.json"
+[ "$(decision 'git push origin dev' "$PCJ")" = "ask" ] \
+  && ok "ask   ← guard.push=true（垃圾值）维持 ask，不开门" \
+  || bad "垃圾值 guard.push=true 竟放行了 push —— 写错格式意外开门"
+
+# 开关只管 push：其他 ASK 规则不受影响
+[ "$(decision 'sudo systemctl restart nginx' "$PC")" = "ask" ] \
+  && ok "ask   ← 开关不影响其他 ASK 规则（sudo 仍转人工）" \
+  || bad "guard.push 开关波及了无关规则"
 
 # ─────────────────────────────────────────────────────────────
 echo

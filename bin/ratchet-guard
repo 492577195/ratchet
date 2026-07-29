@@ -458,31 +458,50 @@ SED_INPLACE = re.compile(r"\bsed\b[^;|&]*\s-i")
 GIT_WRITE = re.compile(r"\bgit\b[^;|&]*\b(commit|add|checkout|reset|restore|apply|rm|mv|stash|push)\b")
 
 
+def load_guard_config(root: str) -> dict:
+    """读 .ratchet/config.json 的 guard 段（门禁开关）。
+
+    目前只有一个开关：
+
+        { "guard": { "push": "allow" } }   —— 普通 git push 不再转人工确认
+
+    保守解析：只认精确的字符串 "allow"，true / "yes" / 1 等一律按缺省处理
+    （维持 ask）。写错格式不该意外开门。push --force 系在 DENY 表里，
+    不受这个开关影响 —— 能关掉的只有「确认」，关不掉「不可逆保护」。
+
+    config.json 本身对 AI 只读（见 readonly_roots 的自封），这个开关只能
+    由用户手动编辑 —— AI 改不了自己的门禁。
+    """
+    try:
+        with open(os.path.join(root, ".ratchet", "config.json"), encoding="utf-8") as fh:
+            g = json.load(fh).get("guard")
+            return g if isinstance(g, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def readonly_roots(root: str) -> list[str]:
     cfg = os.path.join(root, ".ratchet", "config.json")
     try:
         with open(cfg, encoding="utf-8") as fh:
             paths = json.load(fh).get("readonly_paths") or []
     except (OSError, json.JSONDecodeError, AttributeError):
-        return []
+        paths = []
 
     out = []
     for p in paths:
         if isinstance(p, str) and p:
             out.append(os.path.realpath(os.path.join(root, os.path.expanduser(p))))
 
-    # 自封：声明了只读区，这份配置自己也就成了只读区。
+    # config.json 无条件自封 —— 不再只在声明了只读区时才锁。
     #
-    # 首版漏了这条 —— 只读区保护了判据，却没保护自己。AI 只要把 config.json 里的
-    # readonly_paths 删掉，约束就没了，然后回头随便改判据。实测四种姿势全部得手：
-    # Write 覆盖、Edit 改键名、重定向覆盖，一个没拦住。
-    #
-    # 一个 AI 能自行解除的约束，等于没有约束。
-    #
-    # 用户仍然改得动：手动编辑文件不经过 hook。挡的是 AI 的工具调用。
-    if out:
-        out.append(os.path.realpath(cfg))
+    # 溯源（v0.1.14）：config 新增 guard.push=allow 开关，能解除普通 push 的
+    # 人工确认。它从此不只是「只读区的判据」，本身就成了**解除门禁的通路**。
+    # 一个 AI 能自行解除的约束，等于没有约束 —— 所以无论有没有 readonly_paths，
+    # config 都对 AI 只读。用户手动编辑不经过 hook，不受影响。
+    out.append(os.path.realpath(cfg))
 
+    if paths:
         # 门禁自己也得锁上。
         #
         # 只锁掉 config 是不够的：AI 可以绕开配置，直接把 plugin cache 里的
@@ -534,6 +553,19 @@ def write_targets(cmd: str) -> list[str]:
     return [x for x in t if x]
 
 
+def _ro_reason(hit: str) -> str:
+    """只读区拦截文案。config.json 用专属理由：它拦的不是「改判据」，
+    是「解除门禁」—— guard.push 等开关只能用户手动改。"""
+    name = os.path.basename(hit)
+    if name == "config.json":
+        return (f"{name} 是门禁配置（guard.push 等开关），对 AI 只读。\n"
+                f"它能解除门禁 —— 一个 AI 能自行解除的约束，等于没有约束。\n"
+                f"要改请手动编辑：手动操作不经过 hook。")
+    return (f"{name} 是只读区，不能改。\n"
+            f"它是判据（或受保护的配置）—— 判据被改动，验证就失去意义。\n"
+            f"该改的是被测代码，不是尺子。")
+
+
 def check_readonly(payload: dict, root: str) -> str | None:
     roots = readonly_roots(root)
     if not roots:
@@ -548,9 +580,7 @@ def check_readonly(payload: dict, root: str) -> str | None:
         if isinstance(fp, str) and fp:
             hit = _under(os.path.join(root, fp), roots)
             if hit:
-                return (f"{os.path.basename(hit)} 是只读区，不能改。\n"
-                        f"它是判据（或受保护的配置）—— 判据被改动，验证就失去意义。\n"
-                        f"该改的是被测代码，不是尺子。")
+                return _ro_reason(hit)
 
     # 一·B、apply_patch —— Codex 的文件编辑通路。路径埋在补丁头里
     # （*** Add/Update/Delete File: / *** Move to:），既没有 file_path 键、
@@ -559,8 +589,7 @@ def check_readonly(payload: dict, root: str) -> str | None:
     for tgt in apply_patch_paths(payload):
         hit = _under(os.path.join(root, tgt), roots)
         if hit:
-            return (f"{os.path.basename(hit)} 是只读区，不能改（apply_patch 目标：{tgt}）。\n"
-                    f"判据被改动，验证就失去意义。该改的是被测代码，不是尺子。")
+            return _ro_reason(hit) + f"\n（apply_patch 目标：{tgt}）"
 
     # 二、Bash —— 只看**写入目标**，读和执行一律放行
     cmd = extract_command(payload)
@@ -570,8 +599,7 @@ def check_readonly(payload: dict, root: str) -> str | None:
     for tgt in write_targets(cmd):
         hit = _under(os.path.join(root, tgt), roots)
         if hit:
-            return (f"这条命令会写入只读区 {os.path.basename(hit)}（目标：{tgt}）。\n"
-                    f"判据被改动，验证就失去意义。该改的是被测代码，不是尺子。")
+            return _ro_reason(hit) + f"\n（写入目标：{tgt}）"
 
     # 三、git 的写子命令 + 只读区路径（`cd ro && git commit`、`git -C ro reset`）
     if GIT_WRITE.search(cmd):
@@ -581,8 +609,7 @@ def check_readonly(payload: dict, root: str) -> str | None:
                 continue
             hit = _under(os.path.join(root, tok), roots)
             if hit:
-                return (f"这条命令会对只读区 {os.path.basename(hit)} 做 git 写操作。\n"
-                        f"判据被改动，验证就失去意义。")
+                return _ro_reason(hit) + f"\n（git 写操作目标：{tok}）"
 
     return None
 
@@ -699,7 +726,12 @@ def main() -> int:
     if slop:
         return emit("ask", slop, "slopsquatting", root, cmd, fallback)
 
+    gcfg = load_guard_config(root)
     for rid, pat, why in ASK:
+        # 用户显式关闭的确认（默认全保守：缺省/缺文件/垃圾值都维持 ask）。
+        # 只有 ASK 表能被开关降级 —— DENY 表（不可逆保护）无开关，谁都关不掉。
+        if rid == "push" and gcfg.get("push") == "allow":
+            continue
         if pat.search(scan):
             return emit("ask", why + note, rid, root, cmd, fallback)
 
