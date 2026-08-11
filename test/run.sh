@@ -106,6 +106,155 @@ fi
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "REGRESSION · Codex rollout 不得被判成零轮次"
+# ─────────────────────────────────────────────────────────────
+# 溯源：issue #8。当前 Codex transcript 用 response_item / event_msg，旧解析器只认
+# Claude Code 的顶层 assistant，导致 SessionEnd 对真实会话静默输出 {}、不留日志。
+CXROOT="$TMP/codex-project"
+CXROLL="$TMP/codex-rollout.jsonl"
+CXUNKNOWN="$TMP/codex-unknown.jsonl"
+CXEMPTY="$TMP/codex-empty.jsonl"
+$BIN/ratchet-init --preset standard --root "$CXROOT" >/dev/null 2>&1
+python3 - "$CXROLL" "$CXUNKNOWN" "$CXEMPTY" "$CXROOT/src/app.py" <<'PY'
+import json, sys
+
+rollout, unknown, empty, changed = sys.argv[1:]
+records = [
+    {"type": "session_meta", "payload": {"model_provider": "openai"}},
+    {"type": "response_item", "payload": {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "done"}],
+    }},
+    {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+        "type": "CommandExecution", "command": ["/bin/zsh", "-lc", "pytest -q"],
+    }}},
+    {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+        "type": "FileChange", "changes": {
+            changed: {"type": "update", "move_path": None, "unified_diff": "@@"},
+        },
+    }}},
+    {"type": "event_msg", "payload": {"type": "token_count", "info": {
+        "model_context_window": 200_000,
+        "total_token_usage": {
+            "input_tokens": 120, "cached_input_tokens": 40,
+            "cache_write_input_tokens": 10, "output_tokens": 30, "total_tokens": 150,
+        },
+        "last_token_usage": {
+            "input_tokens": 80, "cached_input_tokens": 20,
+            "cache_write_input_tokens": 10, "output_tokens": 10, "total_tokens": 90,
+        },
+    }}},
+]
+with open(rollout, "w") as fh:
+    for record in records:
+        fh.write(json.dumps(record) + "\n")
+with open(unknown, "w") as fh:
+    fh.write(json.dumps({"type": "future_rollout", "payload": {}}) + "\n")
+open(empty, "w").close()
+PY
+
+cxparsed=$(python3 - "$CXROLL" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.path.abspath("lib"))
+import transcript
+
+d = transcript.parse(sys.argv[1])
+json.dump({
+    "turns": d.turns, "tools": d.tools, "files": d.files_written,
+    "commands": d.commands, "input": d.input_tokens, "output": d.output_tokens,
+    "cache_read": d.cache_read, "cache_write": d.cache_write,
+    "total": d.total_tokens, "context_used": d.context_used,
+    "context_window": d.context_window,
+}, sys.stdout)
+PY
+)
+echo "$cxparsed" | python3 -c 'import json,os,sys
+d=json.load(sys.stdin)
+ok=(d["turns"]==1 and d["tools"]=={"Bash":1,"apply_patch":1}
+    and len(d["files"])==1 and os.path.basename(d["files"][0])=="app.py"
+    and d["commands"]==["pytest -q"]
+    and [d["input"],d["output"],d["cache_read"],d["cache_write"],d["total"]]
+        ==[70,30,40,10,150]
+    and [d["context_used"],d["context_window"]]==[80,200000])
+sys.exit(0 if ok else 1)' \
+  && ok "Codex adapter 抽出轮次、工具、文件、命令与 token（缓存不双计）" \
+  || bad "Codex rollout 解析结果不完整" "$cxparsed"
+
+cxhook=$(printf '{"cwd":"%s","transcript_path":"%s","session_id":"codex-fixture"}' \
+  "$CXROOT" "$CXROLL" | $BIN/ratchet-digest --hook 2>/dev/null)
+if python3 - "$CXROOT" "$cxhook" <<'PY'
+import glob, json, os, sys
+root, output = sys.argv[1:]
+state = json.load(open(os.path.join(root, ".ratchet/state.json")))
+logs = glob.glob(os.path.join(root, ".ratchet/log/*.md"))
+msg = json.loads(output).get("systemMessage", "")
+sess = state["session"]
+raise SystemExit(0 if len(logs) == 1 and "已生成" in msg
+                 and sess["last"] == 1 and sess["log_written"] is False else 1)
+PY
+then
+  ok "Codex SessionEnd 生成一份日志并更新 session 状态"
+else
+  bad "Codex SessionEnd 仍静默漏日志" "$cxhook"
+fi
+
+unknown_out=$(printf '{"cwd":"%s","transcript_path":"%s"}' "$CXROOT" "$CXUNKNOWN" \
+  | $BIN/ratchet-digest --hook 2>/dev/null)
+empty_out=$(printf '{"cwd":"%s","transcript_path":"%s"}' "$CXROOT" "$CXEMPTY" \
+  | $BIN/ratchet-digest --hook 2>/dev/null)
+echo "$unknown_out" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("systemMessage") else 1)' \
+  && [ "$empty_out" = "{}" ] \
+  && ok "未知非空 schema 可见失败；真正空 transcript 仍静默" \
+  || bad "未知 schema 与空 transcript 仍未区分" "unknown=$unknown_out empty=$empty_out"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "DIGEST · 项目外文件聚合，不刷屏"
+# ─────────────────────────────────────────────────────────────
+# 溯源：s-2 会话日志。「改动文件」清单 2/3 是 scratchpad 草稿与 memory
+# （../../../../private/tmp/... 型噪音），真实改动被淹没。项目外文件只留聚合行。
+DGP=$(mktemp -d); trap 'rm -rf "$TMP" "$GTMP" "$DGP"' EXIT
+python3 - "$TMP/files.jsonl" "$DGP" <<'PY'
+import json, os, sys
+out, root = sys.argv[1], sys.argv[2]
+files = [
+    os.path.join(root, "src/a.py"),                    # 项目内
+    os.path.join(root, "..foo/b.py"),                  # 项目内，目录名以 .. 开头（边界）
+    "/private/tmp/claude-501/x/scratchpad/c3.txt",     # 项目外 scratchpad
+    "/private/tmp/claude-501/x/scratchpad/mkfix.py",   # 项目外 scratchpad
+    os.path.expanduser("~/.claude/projects/p/memory/MEMORY.md"),  # 项目外 memory
+]
+recs = [{"type": "assistant", "message": {"model": "claude-opus-4-8", "usage": {},
+        "content": [{"type": "tool_use", "name": "Write", "input": {"file_path": f}}]}}
+        for f in files]
+with open(out, "w") as fh:
+    for r in recs:
+        fh.write(json.dumps(r) + "\n")
+PY
+body=$($BIN/ratchet-digest --transcript "$TMP/files.jsonl" --session 1 --root "$DGP")
+echo "$body" | grep -q '`src/a.py`' && ok "项目内文件正常列出" || bad "项目内文件丢失" "$(echo "$body" | grep -A6 '改动文件')"
+echo "$body" | grep -q '`..foo/b.py`' && ok "..foo 型目录不被误判为项目外" || bad "..foo 型目录被误聚合（边界 bug）" "$(echo "$body" | grep -A6 '改动文件')"
+if echo "$body" | grep -q 'scratchpad/c3.txt\|MEMORY.md'; then
+  bad "项目外文件明细仍刷屏"
+else
+  ok "项目外文件明细不再出现"
+fi
+echo "$body" | grep -q '另改动 3 个项目外文件' && ok "项目外文件聚合成一行（3 个）" || bad "聚合行缺失或计数错误" "$(echo "$body" | grep -A6 '改动文件')"
+
+# 全部文件都在项目外时：标题下只剩聚合行，不留空标题
+python3 - "$TMP/outside.jsonl" <<'PY'
+import json, sys
+recs = [{"type": "assistant", "message": {"model": "claude-opus-4-8", "usage": {},
+        "content": [{"type": "tool_use", "name": "Write", "input": {"file_path": "/private/tmp/t/f.py"}}]}}]
+with open(sys.argv[1], "w") as fh:
+    for r in recs:
+        fh.write(json.dumps(r) + "\n")
+PY
+body=$($BIN/ratchet-digest --transcript "$TMP/outside.jsonl" --session 1 --root "$DGP")
+echo "$body" | grep -q '另改动 1 个项目外文件' && ok "纯项目外会话也有聚合行" || bad "纯项目外会话聚合行缺失" "$(echo "$body" | grep -A4 '改动文件')"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "GUARD · 危险动作拦截"
 # ─────────────────────────────────────────────────────────────
 # cwd 必须是隔离沙箱，不能是 $PWD。guard 会按 cwd 找 .ratchet/ 并追加 hits.jsonl，
@@ -114,10 +263,11 @@ echo "GUARD · 危险动作拦截"
 # 「有 .ratchet 时确实会写 hits」由下方 $PJ 那条用例覆盖。
 GTMP=$(mktemp -d); trap 'rm -rf "$TMP" "$GTMP"' EXIT
 
-# decision <命令> -> deny|ask|allow
+# decision <命令> [cwd] -> deny|ask|allow。cwd 缺省为无 .ratchet 的 GTMP 沙箱；
+# 传第二参可指定带 config 的项目根（push 开关等配置相关用例用）。
 decision() {
   printf '{"tool_name":"Bash","tool_input":{"command":%s},"cwd":"%s"}' \
-    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" "$GTMP" \
+    "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1")" "${2:-$GTMP}" \
   | $BIN/ratchet-guard 2>/dev/null \
   | python3 -c 'import json,sys
 d=json.load(sys.stdin).get("hookSpecificOutput")
@@ -211,6 +361,10 @@ expect allow "git resetting-branch-name"
 
 # force-with-lease 是安全强推，不该 deny（但 push 本身仍值得确认 → ask）
 expect ask "git push --force-with-lease origin feature"
+
+# 普通 push 缺省也是 ask（基线：guard.push 开关的缺省保守侧。
+# 开关开启后的放行由下方「PUSH 分级」段覆盖）
+expect ask "git push origin dev"
 
 # ── 提到 ≠ 执行 ──────────────────────────────────────────────
 # 首版对整条命令原文做匹配，于是「只是提到危险串」的命令也被 deny：写文档、
@@ -386,7 +540,11 @@ print(d["permissionDecision"] if d else "allow")')
 ro_expect allow Write "$(ro_json file_path "$PWD/bin/ratchet-guard" content x)" \
   "开发模式下 guard 源码可改（否则没法开发 ratchet 自己）"
 
-# 但没声明只读区的项目，config.json 不该被无端锁住 —— 否则谁也配不了它
+# config.json 无条件自封（v0.1.14 起，不再要求先声明只读区）。
+# 溯源：config 新增 guard.push=allow 开关后，它本身就是**解除门禁的通路** ——
+# AI 能编辑它，等于 AI 能关掉自己的门禁。配它的是用户（手动编辑不经过 hook），
+# 不是 AI。这条断言曾被设计成相反的（「没声明只读区时不该锁 config，否则谁也
+# 配不了它」）—— 那个理由在 config 能解除门禁之后不再成立，随设计反转。
 NORO=$(mktemp -d); mkdir -p "$NORO/.ratchet"
 printf '{"preset":"standard"}' > "$NORO/.ratchet/config.json"
 got=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s/.ratchet/config.json","content":"x"},"cwd":"%s"}' "$NORO" "$NORO" \
@@ -394,8 +552,18 @@ got=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s/.ratchet/config
   | python3 -c 'import json,sys
 d=json.load(sys.stdin).get("hookSpecificOutput")
 print(d["permissionDecision"] if d else "allow")')
-[ "$got" = "allow" ] && ok "allow  ← 未声明只读区时 config.json 可正常编辑" \
-  || bad "无只读区的项目里 config.json 被锁死 —— 那就没人配得了它"
+[ "$got" = "deny" ] && ok "deny  ← AI 编辑 config（它能解除门禁，无条件自封）" \
+  || bad "config.json 能被 AI 编辑 —— guard.push 等开关可以被 AI 自己打开"
+
+# 连「项目还没 init、config 不存在」也不能让 AI 自己创建一份 ——
+# 否则 AI 写出 guard.push=allow 就给自己开了门
+got=$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s/.ratchet/config.json","content":"{}"},"cwd":"%s"}' "$GTMP" "$GTMP" \
+  | $BIN/ratchet-guard 2>/dev/null \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin).get("hookSpecificOutput")
+print(d["permissionDecision"] if d else "allow")')
+[ "$got" = "deny" ] && ok "deny  ← AI 在未 init 项目里自创 config（给自己开门）" \
+  || bad "AI 能自创 config.json —— guard.push 开关形同虚设"
 
 # ── Codex apply_patch：与 CC 的 payload 形状不同，guard 曾两头都错 ──────
 # apply_patch 没有 tool_input.file_path，路径埋在补丁头里，正文也不是 shell 命令。
@@ -431,6 +599,47 @@ echo "$out" | grep -qi "warning\|traceback" && bad "guard 输出混入噪声" "$
 # 决策必须走 JSON body，退出码恒 0（非 0 会被平台当成 hook 自身故障）
 printf '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"cwd":"%s"}' "$GTMP" | $BIN/ratchet-guard >/dev/null 2>&1
 [ $? -eq 0 ] && ok "deny 时退出码仍为 0（决策走 JSON，非退出码）" || bad "deny 时退出码非 0 —— 会被平台误判为 hook 故障"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "PUSH 分级 · guard.push 开关"
+# ─────────────────────────────────────────────────────────────
+# 溯源：hits.jsonl 84 条命中里 push ask 40 次、deny 0 次 —— 最高频机制税。
+# 用户显式配置 { "guard": { "push": "allow" } } 后普通 push 不再转人工。
+# 设计红线：
+#   · 缺省/缺文件/垃圾值 → 维持 ask（老用户升级行为不变，写错格式不开门）
+#   · DENY 表（push --force 系）无开关 —— 能关掉的只有「确认」，
+#     关不掉「不可逆保护」
+#   · config.json 对 AI 只读（上方 READONLY 段），开关只能用户手动开
+PC=$(mktemp -d); mkdir -p "$PC/.ratchet"; trap 'rm -rf "$TMP" "$GTMP" "$DGP" "$PC" "$PCJ"' EXIT
+printf '{"preset":"standard","guard":{"push":"allow"}}' > "$PC/.ratchet/config.json"
+
+[ "$(decision 'git push origin dev' "$PC")" = "allow" ] \
+  && ok "allow ← guard.push=allow 时普通 push 放行" \
+  || bad "guard.push=allow 未生效：普通 push 仍被转人工"
+[ "$(decision 'git push --force-with-lease origin feature' "$PC")" = "allow" ] \
+  && ok "allow ← force-with-lease 也随开关放行（它本在 ASK 档）" \
+  || bad "force-with-lease 未随开关放行"
+
+# DENY 表无开关：force 系写法一种都不能被 config 放掉
+[ "$(decision 'git push --force origin main' "$PC")" = "deny" ] \
+  && ok "deny  ← 开关开启时 push --force 仍拒（DENY 无开关）" \
+  || bad "guard.push=allow 竟放掉了 push --force —— 不可逆保护被开关穿透"
+[ "$(decision 'git push -f' "$PC")" = "deny" ] \
+  && ok "deny  ← 开关开启时 push -f 仍拒" \
+  || bad "guard.push=allow 竟放掉了 push -f"
+
+# 保守解析：垃圾值不开门（true / "yes" / 1 都不是精确的 "allow"）
+PCJ=$(mktemp -d); mkdir -p "$PCJ/.ratchet"
+printf '{"guard":{"push":true}}' > "$PCJ/.ratchet/config.json"
+[ "$(decision 'git push origin dev' "$PCJ")" = "ask" ] \
+  && ok "ask   ← guard.push=true（垃圾值）维持 ask，不开门" \
+  || bad "垃圾值 guard.push=true 竟放行了 push —— 写错格式意外开门"
+
+# 开关只管 push：其他 ASK 规则不受影响
+[ "$(decision 'sudo systemctl restart nginx' "$PC")" = "ask" ] \
+  && ok "ask   ← 开关不影响其他 ASK 规则（sudo 仍转人工）" \
+  || bad "guard.push 开关波及了无关规则"
 
 # ─────────────────────────────────────────────────────────────
 echo
@@ -936,6 +1145,72 @@ echo "$cxout" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 
 codex_pay "$TMP/hkgood" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decision" \
   && bad "Codex 形状下合法 state 被误伤" \
   || ok "Codex apply_patch + 合法 state → 静默放行"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "HOOK·兼容 · macOS 系统 Python 3.9 可启动核心入口"
+# ─────────────────────────────────────────────────────────────
+# 溯源：合并 v0.1.14 前的真实 --plugin-dir 会话里，Claude hook 环境命中
+# /usr/bin/python3 3.9；PEP 604 注解在导入期求值，SessionEnd 尚未执行就崩溃。
+compat_python=""
+if [ -x /usr/bin/python3 ] \
+   && /usr/bin/python3 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 9) else 1)' 2>/dev/null; then
+  compat_python=/usr/bin/python3
+elif command -v python3.9 >/dev/null 2>&1; then
+  compat_python=$(command -v python3.9)
+fi
+
+future_ok=$(python3 - "$BIN/ratchet-digest" "$BIN/ratchet-guard" <<'PY'
+import ast
+import sys
+
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), filename=path)
+    imports = {
+        name.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__"
+        for name in node.names
+    }
+    if "annotations" not in imports:
+        raise SystemExit(1)
+print("yes")
+PY
+)
+
+compat_ok=yes
+if [ -n "$compat_python" ]; then
+  "$compat_python" "$BIN/ratchet-digest" --help >/dev/null 2>&1 || compat_ok=no
+  guard_out=$(printf '{"tool_name":"Bash","tool_input":{"command":"pwd"},"cwd":"%s"}' "$TMP" \
+    | "$compat_python" "$BIN/ratchet-guard" 2>/dev/null) || compat_ok=no
+  [ "$guard_out" = "{}" ] || compat_ok=no
+fi
+
+[ "$future_ok" = yes ] && [ "$compat_ok" = yes ] \
+  && ok "核心 hook 延迟求值注解；检测到 Python 3.9 时入口实跑通过" \
+  || bad "核心 hook 无法由 Python 3.9 启动"
+
+# ─────────────────────────────────────────────────────────────
+echo
+echo "HOOK·配置 · SessionEnd 超时不得超过 Codex 3 秒上限"
+# ─────────────────────────────────────────────────────────────
+# 溯源：issue #7。Codex 会把更大的值钳制为 3 秒并打印启动告警，导致源码契约
+# 与实际运行时分叉。官方约束：https://developers.openai.com/codex/hooks
+if python3 - <<'PY'
+import json
+
+with open("hooks.json") as fh:
+    hooks = json.load(fh)["hooks"]["SessionEnd"]
+
+timeouts = [handler["timeout"] for group in hooks for handler in group["hooks"]]
+raise SystemExit(0 if timeouts and all(0 < value <= 3 for value in timeouts) else 1)
+PY
+then
+  ok "SessionEnd 显式 timeout 均在 Codex 支持范围 (0, 3] 秒"
+else
+  bad "SessionEnd timeout 超过 Codex 3 秒上限 —— 加载时会被钳制"
+fi
 
 # ─────────────────────────────────────────────────────────────
 echo

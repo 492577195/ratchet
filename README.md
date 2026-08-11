@@ -179,6 +179,17 @@ $ pip install requests-toolbelt-pro
 
 这是**拒绝**，不是提醒。模型说服不了它，因为它不是模型。
 
+普通 `git push` 默认转人工确认（外向动作，值得停下来看一眼）。嫌它吵的话，
+在 `.ratchet/config.json` 里显式关掉：
+
+```json
+{ "guard": { "push": "allow" } }
+```
+
+缺省 / 不写 / 写错值都维持确认 —— 升级不会让任何人的保护静默消失。
+`push --force` 系永远是 deny，没有开关：能关掉的只有「确认」，关不掉「不可逆保护」。
+而 `config.json` 本身对 AI 只读 —— 能解除门禁的配置，只能你手动改。
+
 **给脚手架自己做体检（`ratchet-overhead`）**
 
 ```
