@@ -106,6 +106,109 @@ fi
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "REGRESSION · Codex rollout 不得被判成零轮次"
+# ─────────────────────────────────────────────────────────────
+# 溯源：issue #8。当前 Codex transcript 用 response_item / event_msg，旧解析器只认
+# Claude Code 的顶层 assistant，导致 SessionEnd 对真实会话静默输出 {}、不留日志。
+CXROOT="$TMP/codex-project"
+CXROLL="$TMP/codex-rollout.jsonl"
+CXUNKNOWN="$TMP/codex-unknown.jsonl"
+CXEMPTY="$TMP/codex-empty.jsonl"
+$BIN/ratchet-init --preset standard --root "$CXROOT" >/dev/null 2>&1
+python3 - "$CXROLL" "$CXUNKNOWN" "$CXEMPTY" "$CXROOT/src/app.py" <<'PY'
+import json, sys
+
+rollout, unknown, empty, changed = sys.argv[1:]
+records = [
+    {"type": "session_meta", "payload": {"model_provider": "openai"}},
+    {"type": "response_item", "payload": {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "done"}],
+    }},
+    {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+        "type": "CommandExecution", "command": ["/bin/zsh", "-lc", "pytest -q"],
+    }}},
+    {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+        "type": "FileChange", "changes": {
+            changed: {"type": "update", "move_path": None, "unified_diff": "@@"},
+        },
+    }}},
+    {"type": "event_msg", "payload": {"type": "token_count", "info": {
+        "model_context_window": 200_000,
+        "total_token_usage": {
+            "input_tokens": 120, "cached_input_tokens": 40,
+            "cache_write_input_tokens": 10, "output_tokens": 30, "total_tokens": 150,
+        },
+        "last_token_usage": {
+            "input_tokens": 80, "cached_input_tokens": 20,
+            "cache_write_input_tokens": 10, "output_tokens": 10, "total_tokens": 90,
+        },
+    }}},
+]
+with open(rollout, "w") as fh:
+    for record in records:
+        fh.write(json.dumps(record) + "\n")
+with open(unknown, "w") as fh:
+    fh.write(json.dumps({"type": "future_rollout", "payload": {}}) + "\n")
+open(empty, "w").close()
+PY
+
+cxparsed=$(python3 - "$CXROLL" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.path.abspath("lib"))
+import transcript
+
+d = transcript.parse(sys.argv[1])
+json.dump({
+    "turns": d.turns, "tools": d.tools, "files": d.files_written,
+    "commands": d.commands, "input": d.input_tokens, "output": d.output_tokens,
+    "cache_read": d.cache_read, "cache_write": d.cache_write,
+    "total": d.total_tokens, "context_used": d.context_used,
+    "context_window": d.context_window,
+}, sys.stdout)
+PY
+)
+echo "$cxparsed" | python3 -c 'import json,os,sys
+d=json.load(sys.stdin)
+ok=(d["turns"]==1 and d["tools"]=={"Bash":1,"apply_patch":1}
+    and len(d["files"])==1 and os.path.basename(d["files"][0])=="app.py"
+    and d["commands"]==["pytest -q"]
+    and [d["input"],d["output"],d["cache_read"],d["cache_write"],d["total"]]
+        ==[70,30,40,10,150]
+    and [d["context_used"],d["context_window"]]==[80,200000])
+sys.exit(0 if ok else 1)' \
+  && ok "Codex adapter 抽出轮次、工具、文件、命令与 token（缓存不双计）" \
+  || bad "Codex rollout 解析结果不完整" "$cxparsed"
+
+cxhook=$(printf '{"cwd":"%s","transcript_path":"%s","session_id":"codex-fixture"}' \
+  "$CXROOT" "$CXROLL" | $BIN/ratchet-digest --hook 2>/dev/null)
+if python3 - "$CXROOT" "$cxhook" <<'PY'
+import glob, json, os, sys
+root, output = sys.argv[1:]
+state = json.load(open(os.path.join(root, ".ratchet/state.json")))
+logs = glob.glob(os.path.join(root, ".ratchet/log/*.md"))
+msg = json.loads(output).get("systemMessage", "")
+sess = state["session"]
+raise SystemExit(0 if len(logs) == 1 and "已生成" in msg
+                 and sess["last"] == 1 and sess["log_written"] is False else 1)
+PY
+then
+  ok "Codex SessionEnd 生成一份日志并更新 session 状态"
+else
+  bad "Codex SessionEnd 仍静默漏日志" "$cxhook"
+fi
+
+unknown_out=$(printf '{"cwd":"%s","transcript_path":"%s"}' "$CXROOT" "$CXUNKNOWN" \
+  | $BIN/ratchet-digest --hook 2>/dev/null)
+empty_out=$(printf '{"cwd":"%s","transcript_path":"%s"}' "$CXROOT" "$CXEMPTY" \
+  | $BIN/ratchet-digest --hook 2>/dev/null)
+echo "$unknown_out" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("systemMessage") else 1)' \
+  && [ "$empty_out" = "{}" ] \
+  && ok "未知非空 schema 可见失败；真正空 transcript 仍静默" \
+  || bad "未知 schema 与空 transcript 仍未区分" "unknown=$unknown_out empty=$empty_out"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "DIGEST · 项目外文件聚合，不刷屏"
 # ─────────────────────────────────────────────────────────────
 # 溯源：s-2 会话日志。「改动文件」清单 2/3 是 scratchpad 草稿与 memory

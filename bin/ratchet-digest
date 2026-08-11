@@ -220,6 +220,8 @@ def run_hook(payload: dict) -> int:
     d = transcript.parse(payload.get("transcript_path", ""),
                          transcript.load_config(root).get("context_window"))
     if not d.turns:
+        if d.unrecognized:
+            return fail_visibly("transcript 非空但格式无法识别（可能平台 schema 已变化）")
         print("{}")
         return 0  # 空会话不留痕
 

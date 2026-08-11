@@ -47,7 +47,7 @@ def main() -> int:
         window = int(sys.argv[sys.argv.index("--window") + 1])
 
     try:
-        # 窗口大小是环境属性，transcript 里没有 —— 优先读 .ratchet/config.json
+        # 显式配置优先；未配置时，Codex transcript 有实测窗口，Claude 走保守兜底。
         if window is None:
             window = transcript.load_config().get("context_window")
         d = transcript.parse(path, window)
