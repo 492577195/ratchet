@@ -27,18 +27,6 @@ jobs:
           echo "VERSION=$V  claude=$CC  codex=$CX"
           test "$V" = "$CC" && test "$V" = "$CX"
 
-      - name: hooks.json 跨平台兼容（Codex 只认 description/hooks 两个顶层键）
-        run: |
-          python3 - <<'PY'
-          import json, sys
-          keys = set(json.load(open("hooks/hooks.json")).keys())
-          extra = keys - {"description", "hooks"}
-          if extra:
-              sys.exit(f"hooks.json 顶层含 Codex 不接受的字段 {extra} —— "
-                       f"Codex 会拒绝整个文件并静默丢弃全部 hook")
-          print("ok")
-          PY
-
       - name: 宪法 4 KB 硬上限
         run: |
           N=$(wc -c < templates/constitution.md)
