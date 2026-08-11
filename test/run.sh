@@ -1045,6 +1045,27 @@ codex_pay "$TMP/hkgood" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decis
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "HOOK·配置 · SessionEnd 超时不得超过 Codex 3 秒上限"
+# ─────────────────────────────────────────────────────────────
+# 溯源：issue #7。Codex 会把更大的值钳制为 3 秒并打印启动告警，导致源码契约
+# 与实际运行时分叉。官方约束：https://developers.openai.com/codex/hooks
+if python3 - <<'PY'
+import json
+
+with open("hooks.json") as fh:
+    hooks = json.load(fh)["hooks"]["SessionEnd"]
+
+timeouts = [handler["timeout"] for group in hooks for handler in group["hooks"]]
+raise SystemExit(0 if timeouts and all(0 < value <= 3 for value in timeouts) else 1)
+PY
+then
+  ok "SessionEnd 显式 timeout 均在 Codex 支持范围 (0, 3] 秒"
+else
+  bad "SessionEnd timeout 超过 Codex 3 秒上限 —— 加载时会被钳制"
+fi
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "HOOK·协议 · 每个事件只准说平台听得懂的话"
 # ─────────────────────────────────────────────────────────────
 # 同一个病根，本项目已经栽了两次：凭印象写 hook 输出格式。
