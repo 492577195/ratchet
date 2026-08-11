@@ -1148,6 +1148,51 @@ codex_pay "$TMP/hkgood" | $BIN/ratchet-state --hook 2>/dev/null | grep -q "decis
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "HOOK·兼容 · macOS 系统 Python 3.9 可启动核心入口"
+# ─────────────────────────────────────────────────────────────
+# 溯源：合并 v0.1.14 前的真实 --plugin-dir 会话里，Claude hook 环境命中
+# /usr/bin/python3 3.9；PEP 604 注解在导入期求值，SessionEnd 尚未执行就崩溃。
+compat_python=""
+if [ -x /usr/bin/python3 ] \
+   && /usr/bin/python3 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 9) else 1)' 2>/dev/null; then
+  compat_python=/usr/bin/python3
+elif command -v python3.9 >/dev/null 2>&1; then
+  compat_python=$(command -v python3.9)
+fi
+
+future_ok=$(python3 - "$BIN/ratchet-digest" "$BIN/ratchet-guard" <<'PY'
+import ast
+import sys
+
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), filename=path)
+    imports = {
+        name.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__"
+        for name in node.names
+    }
+    if "annotations" not in imports:
+        raise SystemExit(1)
+print("yes")
+PY
+)
+
+compat_ok=yes
+if [ -n "$compat_python" ]; then
+  "$compat_python" "$BIN/ratchet-digest" --help >/dev/null 2>&1 || compat_ok=no
+  guard_out=$(printf '{"tool_name":"Bash","tool_input":{"command":"pwd"},"cwd":"%s"}' "$TMP" \
+    | "$compat_python" "$BIN/ratchet-guard" 2>/dev/null) || compat_ok=no
+  [ "$guard_out" = "{}" ] || compat_ok=no
+fi
+
+[ "$future_ok" = yes ] && [ "$compat_ok" = yes ] \
+  && ok "核心 hook 延迟求值注解；检测到 Python 3.9 时入口实跑通过" \
+  || bad "核心 hook 无法由 Python 3.9 启动"
+
+# ─────────────────────────────────────────────────────────────
+echo
 echo "HOOK·配置 · SessionEnd 超时不得超过 Codex 3 秒上限"
 # ─────────────────────────────────────────────────────────────
 # 溯源：issue #7。Codex 会把更大的值钳制为 3 秒并打印启动告警，导致源码契约

@@ -19,6 +19,8 @@ ratchet-digest — 从 transcript 自动生成 session 日志的「机械部分�
 s-1.md，与 hook 的约定分叉；`--out` 是开关不是路径，就是为了不留这个口子）。
 不带 --out 时只渲染到 stdout，由调用方处置。
 """
+from __future__ import annotations
+
 import argparse
 import datetime
 import json

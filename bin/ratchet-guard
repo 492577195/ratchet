@@ -25,6 +25,8 @@ AI 一句 `npm install` 就中招，post-install 脚本在毫秒级窃取云凭�
   放行时输出 {} 并 exit 0。**决策一律走 JSON body，不用退出码** —— 退出码非 0
   会被平台当成 hook 自身故障，而不是「拒绝」。
 """
+from __future__ import annotations
+
 import datetime
 import json
 import os
