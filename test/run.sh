@@ -1508,6 +1508,14 @@ $BIN/ratchet-brief --state "$TMP/empty.json" >/dev/null 2>&1
 
 # ─────────────────────────────────────────────────────────────
 echo
+echo "PLAINSPEAK · 只读观测，不拦截"
+if python3 "$ROOT/test/plainspeak.py"; then
+  ok "plainspeak 回归测试通过"
+else
+  bad "plainspeak 回归测试失败"
+fi
+
+echo
 echo "HYGIENE · 测试不得污染本仓的运行时数据"
 # ─────────────────────────────────────────────────────────────
 # 溯源：P5 dogfood 给本仓装上 .ratchet/ 之后，GUARD 段的 cwd 还写着 $PWD，
