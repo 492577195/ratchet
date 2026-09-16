@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Stop 旁路观测：只记录正文指标，不向宿主返回决策。"""
+
+import datetime
+import json
+import os
+import re
+import sys
+
+
+TAIL_LIMIT = 256 * 1024
+IDENTS = (
+    re.compile(r"`[^`]+`"),
+    re.compile(r"\b[\w.-]+\.(?:py|json|jsonl|md|toml|sh|yaml|yml)\b"),
+    re.compile(r"(?<!\w)/[\w./-]{4,}"),
+    re.compile(r"\b[A-Z][A-Z0-9_]{3,}\b"),
+)
+LEADS = ("结论", "已完成", "已修", "完成", "风险", "需要你", "需要用户",
+         "建议", "失败", "成功", "不能", "可以")
+
+
+def body(record):
+    """沿用 lib/transcript.py 的 CC / Codex message 结构；None 表示非正文消息。"""
+    if not isinstance(record, dict):
+        return None
+    if record.get("type") == "assistant":
+        message = record.get("message")
+        text_type = "text"
+    elif record.get("type") == "response_item":
+        message = record.get("payload")
+        if (not isinstance(message, dict) or message.get("type") != "message"
+                or message.get("role") != "assistant"
+                or message.get("channel") == "analysis"):
+            return None
+        text_type = "output_text"
+    else:
+        return None
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content", [])
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    return "".join(block["text"] for block in content
+                   if isinstance(block, dict) and block.get("type") == text_type
+                   and isinstance(block.get("text"), str))
+
+
+def last_body(path):
+    # 二进制定位到末尾，先分行再解码，避免截断处的半个 UTF-8 字符影响完整行。
+    with open(path, "rb", buffering=0) as fh:
+        size = fh.seek(0, os.SEEK_END)
+        start = max(0, size - TAIL_LIMIT)
+        fh.seek(start)
+        lines = fh.read(TAIL_LIMIT).split(b"\n")
+    if start:
+        lines = lines[1:]  # 不把窗口开头可能被截断的 JSON 当作完整记录。
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            text = body(json.loads(line.decode("utf-8")))
+        except (ValueError, UnicodeError):
+            continue
+        if text is not None:
+            return text
+    return None
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+        text = last_body(payload["transcript_path"])
+        if text is not None:
+            root = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "..", "lib"))
+            from paths import ensure_dir
+
+            lead = ("conclusion" if any(word in text[:200] for word in LEADS)
+                    else "detail") if text else "unknown"
+            record = {
+                "rule": "plainspeak", "decision": "observe",
+                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                "chars": len(text),
+                "idents": sum(len(pattern.findall(text)) for pattern in IDENTS),
+                "lead": lead, "sid": str(payload.get("session_id") or "")[:8],
+            }
+            directory = os.path.join(root, ".ratchet")
+            ensure_dir(directory)
+            with open(os.path.join(directory, "hits.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # 观测失败必须静默，不能影响会话。
+    print("{}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

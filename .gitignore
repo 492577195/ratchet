@@ -13,3 +13,7 @@ __pycache__/
 # 本仓库的工作纪律权威副本是 AGENTS.md，不是 .ratchet/constitution.md（后者是 init 的生成物）。
 # 想看规则长什么样：docs/example-rule.md。
 .ratchet/
+
+# .delegate/ 与 .ratchet/ 同性质：codex-delegate 的委派流水账，是「这台机器上这个人」
+# 的运行时留痕，不是产品。理由同上 —— 不该跟着代码分发给每一个安装者。
+.delegate/

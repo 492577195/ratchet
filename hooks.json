@@ -43,6 +43,20 @@
         ]
       }
     ],
+    "Stop": [
+      {
+        "_purpose": "只读观测 AI 正文的技术化程度，不拦截、不注入、不改写；记录一周数据后用于判断表达软规则是否有效、是否需要升级为门禁。",
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/ratchet-plainspeak",
+            "timeout": 3,
+            "async": false
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "_purpose": "收尾自动留痕（K2）。从 transcript 抽出机械事实（改了哪些文件/跑了哪些命令/token 用量）写入日志草稿，并把 state.session.log_written 置为 false。模型下次起手会被提示补写『决策与教训』那一段 —— 机器写得出来的，不该占用模型的推理算力。",
